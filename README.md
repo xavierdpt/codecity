@@ -436,11 +436,5 @@ Some things that make a change easy to take:
 
 # License
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md) — free to use, modify and share for
-any noncommercial purpose, including personal projects, study, research,
-education, and use by charities, public research bodies and government
-institutions.
-
-Be aware that a noncommercial restriction is not open source in the OSI sense,
-and GitHub will not recognise it as a standard license. If you want to use this
-commercially, ask.
+[MIT](LICENSE). Do what you like with it — use it, change it, ship it, sell it —
+as long as the copyright notice comes along. No warranty.
