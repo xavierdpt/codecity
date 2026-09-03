@@ -1,0 +1,6 @@
+# build output
+elfcity
+*.o
+
+# screenshots from --shot
+*.ppm
