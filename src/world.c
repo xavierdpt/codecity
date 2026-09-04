@@ -123,6 +123,45 @@ void emit_ceiling(const Building *b, int fl, BoxSink f, void *ud){
 }
 
 /* ------------------------------------------------------------------ */
+/* chamber alcoves                                                     */
+/* ------------------------------------------------------------------ */
+
+/* The seven reachable cells: the middle is circulation and (1,0) is the
+   doorway you came in through. */
+static const int CELL_XY[7][2] = {{0,0},{2,0},{0,1},{2,1},{0,2},{1,2},{2,2}};
+
+int room_cell_rect(const Building *b, const Room *r, int u,
+                   float *x0, float *z0, float *x1, float *z1){
+    if (!r || r->kind != RT_GROUP || u < 0 || u >= r->nunits || u >= 7) return 0;
+    float rx0 = room_x0(b, r), rx1 = room_x1(b, r);
+    float rz0 = room_z0(b, r), rz1 = room_z1(b, r);
+    float pitch = b->tile;
+    float cw = r->cellw * pitch, ch = r->cellh * pitch;
+    float availW = rx1 - rx0 - 2 * TILE_MARGIN;
+    float availD = rz1 - rz0 - TILE_SETBACK - TILE_MARGIN;
+    float ox = rx0 + TILE_MARGIN + (availW - 3 * cw) * 0.5f;
+    float oz = rz0 + TILE_SETBACK + (availD - 3 * ch) * 0.5f;
+    *x0 = ox + CELL_XY[u][0] * cw; *x1 = *x0 + cw;
+    *z0 = oz + CELL_XY[u][1] * ch; *z1 = *z0 + ch;
+    return 1;
+}
+
+/* which alcove is the visitor standing at, or -1 */
+int room_unit_at(const Building *b, const Room *r, float wx, float wz){
+    if (!r || r->kind != RT_GROUP) return -1;
+    int best = -1; float bd = 1e18f;
+    for (int u = 0; u < r->nunits && u < 7; u++){
+        float x0, z0, x1, z1;
+        if (!room_cell_rect(b, r, u, &x0, &z0, &x1, &z1)) continue;
+        float cx = (x0 + x1) * 0.5f, cz = (z0 + z1) * 0.5f;
+        float dx = wx - cx, dz = wz - cz, d = dx*dx + dz*dz;
+        if (d < bd){ bd = d; best = u; }
+    }
+    /* only claim it when you are actually beside it */
+    return (bd < 36.0f) ? best : -1;
+}
+
+/* ------------------------------------------------------------------ */
 /* spiral stair                                                        */
 /* ------------------------------------------------------------------ */
 

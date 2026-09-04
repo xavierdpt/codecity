@@ -50,6 +50,32 @@
 > skipped buildings under three floors and stopped climbing at floor 3. The
 > stair now stops at `(nfloors-1) * FLOOR_H`, and the test climbs to each
 > building's own top.
+>
+> **Sculptures: the cap is gone.** `MAX_INS_PER_ROOM` was 640, harmless while
+> rooms had a fixed 44x8 grid but severe once a room is sized for its whole
+> function: `git`'s biggest room showed 640 of 4634 instructions on a 38 x 37 m
+> floor — 14% covered, 86% bare plinth. Across `git`, 4.9% of functions were
+> truncated but they held **40.7% of the code bytes**. Only one room is decoded
+> at a time and the worst function in `/usr/bin` is ~5000 instructions, so the
+> cap bought about half a megabyte; it is now 0, meaning decode it all.
+>
+> Two defects went with it:
+>
+> - **The grid under-sized small rooms.** `room_tiles()` assumed 4 bytes an
+>   instruction; 214 of 360 sampled rooms held more instructions than tiles,
+>   and `layout_code()` absorbed that by shrinking the sculpture pitch away
+>   from the room's own tile size. A single constant cannot fit both ends —
+>   measured over 1500 `git` rooms, short functions run about 3.2 B an
+>   instruction while the largest run 5.2 — so the estimate now rises with
+>   the log of the size, `2.9 + 0.20 * log2(size/64)` clamped to [2.8, 5.0].
+>   Big rooms went from 14% to 89-97% covered, with 5.8% of rooms overflowing.
+> - **Chambers were decoded as one blob.** `room_is_code()` accepted
+>   `RT_GROUP`, so walking into a chamber threw away the seven alcoves and
+>   disassembled the *first* unit's bytes across the whole room. Chambers are
+>   now entered per alcove: `city_enter_unit()` decodes the one you are
+>   standing at, `room_cell_rect()` in `world.c` gives the renderer and the
+>   walk-in logic one shared idea of where each alcove is, and the other six
+>   keep their byte grids.
 
 ---
 

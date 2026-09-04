@@ -31,7 +31,7 @@ typedef struct {
     float  fps;
     float  now;             /* seconds since start, drives the animation */
     int    nearIns;         /* instruction the player is standing next to */
-    int    lastB, lastR;    /* room we last decoded, so we know when to free it */
+    int    lastB, lastR, lastU; /* room+alcove last decoded, so we know when to free */
 } App;
 
 void app_message(App *a, const char *fmt, ...);

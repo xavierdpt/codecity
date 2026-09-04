@@ -120,7 +120,7 @@ int g_disasm_live;      /* live room decodings -- must be 0 or 1 at all times */
 
 Disasm *disasm_run(const uint8_t *code, uint64_t len, uint64_t vaddr, int maxins){
     if (!g_open || !code || !len) return NULL;
-    if (maxins <= 0) maxins = 512;
+    if (maxins < 0) maxins = 0;          /* 0 = decode the whole room */
     cs_insn *ins = NULL;
     size_t got = cs_disasm(g_h, code, (size_t)len, vaddr, (size_t)maxins, &ins);
     if (!got){ if (ins) cs_free(ins, 0); return NULL; }

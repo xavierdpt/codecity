@@ -1,6 +1,7 @@
 /* render.c -- draw the city, the buildings and their interiors */
 #define _GNU_SOURCE
 #include "render.h"
+#include "world.h"
 #include "text.h"
 #include <GL/gl.h>
 #include <GL/glu.h>
@@ -596,18 +597,18 @@ static void draw_tiles(const Building *b, const Room *r, App *ap,
     draw_box(x0 + 0.2f, base, zn + 0.2f, x1 - 0.2f, base + 0.04f, zf - 0.2f);
 
     if (r->kind == RT_GROUP && r->units){
-        float cellW = r->cellw * pitch, cellH = r->cellh * pitch;
-        float ox = x0 + TILE_MARGIN + (availW - 3 * cellW) * 0.5f;
-        float oz = zn + TILE_SETBACK + (availD - 3 * cellH) * 0.5f;
-        static const int CELL[7][2] = {{0,0},{2,0},{0,1},{2,1},{0,2},{1,2},{2,2}};
         for (int u = 0; u < r->nunits && u < 7; u++){
             const Unit *un = &r->units[u];
-            float gx = ox + CELL[u][0] * cellW, gz = oz + CELL[u][1] * cellH;
+            float cx0, cz0, cx1, cz1;
+            if (!room_cell_rect(b, r, u, &cx0, &cz0, &cx1, &cz1)) continue;
             /* the alcove's own little plinth, so the cells read apart */
-            glColor3f(0.20f, 0.21f, 0.24f);
-            draw_box(gx, base + 0.04f, gz, gx + cellW - 0.06f, base + 0.07f, gz + cellH - 0.06f);
+            glColor3f(u == r->activeUnit ? 0.28f : 0.20f,
+                      u == r->activeUnit ? 0.29f : 0.21f,
+                      u == r->activeUnit ? 0.33f : 0.24f);
+            draw_box(cx0, base + 0.04f, cz0, cx1 - 0.06f, base + 0.07f, cz1 - 0.06f);
+            if (u == r->activeUnit && r->dis) continue;   /* sculptures instead */
             draw_grid(RT_FUNC, un->data, un->datasz, un->size ? un->size : un->datasz,
-                      un->tw, un->th, gx, gz, pitch, base + 0.07f, maxh);
+                      un->tw, un->th, cx0, cz0, pitch, base + 0.07f, maxh);
         }
         return;
     }
@@ -671,7 +672,7 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
 
     if (dist > 46.0f) return;              /* too far to bother with contents */
 
-    if (r->dis){                            /* decoded because we are standing in it */
+    if (r->dis && r->kind != RT_GROUP){     /* decoded because we are standing in it */
         draw_code_room(b, r, a, x0, x1, zn, zf, nz, base);
         return;
     }
@@ -679,21 +680,23 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
     switch (r->kind){
     case RT_FUNC: case RT_OBJECT: case RT_BYTES: case RT_GROUP:
         draw_tiles(b, r, a, x0, x1, zn, zf, base);
+        if (r->kind == RT_GROUP && r->dis && r->activeUnit >= 0){
+            float cx0, cz0, cx1, cz1;
+            if (room_cell_rect(b, r, r->activeUnit, &cx0, &cz0, &cx1, &cz1))
+                draw_code_room(b, r, a, cx0, cx1, cz0, cz1, 1.0f, base + 0.07f);
+        }
         if (r->kind == RT_GROUP && r->units){    /* a plaque over each alcove */
             glDisable(GL_LIGHTING); glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND);
-            float pitch = b->tile;
-            float cellW = r->cellw * pitch, cellH = r->cellh * pitch;
-            float availW = x1 - x0 - 2 * TILE_MARGIN;
-            float availD = zf - zn - TILE_SETBACK - TILE_MARGIN;
-            float ox = x0 + TILE_MARGIN + (availW - 3 * cellW) * 0.5f;
-            float oz = zn + TILE_SETBACK + (availD - 3 * cellH) * 0.5f;
-            static const int CELL[7][2] = {{0,0},{2,0},{0,1},{2,1},{0,2},{1,2},{2,2}};
             for (int u = 0; u < r->nunits && u < 7; u++){
-                float cx = ox + (CELL[u][0] + 0.5f) * cellW;
-                float cz = oz + (CELL[u][1] + 0.5f) * cellH;
+                float cx0, cz0, cx1, cz1;
+                if (!room_cell_rect(b, r, u, &cx0, &cz0, &cx1, &cz1)) continue;
+                float cx = (cx0 + cx1) * 0.5f, cz = (cz0 + cz1) * 0.5f;
                 if (fabsf(cx - px) + fabsf(cz - pz) > 26.0f) continue;
-                glColor3f(0.94f, 0.92f, 0.66f);
-                text_billboard(FNT_MONO, cx, base + 1.05f, cz, 0.16f, r->units[u].title);
+                glColor3f(u == r->activeUnit ? 1.00f : 0.94f,
+                          u == r->activeUnit ? 0.96f : 0.92f,
+                          u == r->activeUnit ? 0.45f : 0.66f);
+                text_billboard(FNT_MONO, cx, base + 1.35f, cz,
+                               u == r->activeUnit ? 0.20f : 0.16f, r->units[u].title);
             }
             glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND); glEnable(GL_LIGHTING);
         }

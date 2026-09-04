@@ -161,6 +161,7 @@ typedef struct Room {
     int         cellw, cellh;       /* chamber cell size; 0 if not RT_GROUP */
     Unit       *units;              /* NULL when the room is its own unit */
     int         nunits;
+    int         activeUnit;         /* alcove currently decoded, -1 if none */
 
     int         linkPrev, linkNext; /* interior doors to neighbours */
 
@@ -223,7 +224,9 @@ void  floor_release(Building *b);
 
 /* code rooms: decode on entry, throw away on exit */
 int   room_is_code(const Building *b, const Room *r);
+int   unit_is_code(const Building *b, const Unit *u);
 void  city_enter_room(City *c, int bi, int ri);   /* frees whatever was open */
+void  city_enter_unit(City *c, int bi, int ri, int ui);  /* one chamber alcove */
 void  city_leave_room(City *c);
 const char *elf_sym_at(const Elf *e, uint64_t addr, uint64_t *off);
 

@@ -49,7 +49,7 @@ static Room *rv_add(RoomVec *v){
     if (v->n == v->cap){ v->cap = v->cap ? v->cap * 2 : 64; v->r = realloc(v->r, (size_t)v->cap * sizeof(Room)); }
     Room *r = &v->r[v->n++];
     memset(r, 0, sizeof *r);
-    r->symidx = -1; r->linkPrev = -1; r->linkNext = -1;
+    r->symidx = -1; r->linkPrev = -1; r->linkNext = -1; r->activeUnit = -1;
     return r;
 }
 
@@ -393,11 +393,24 @@ static void realize_room(Building *b, Room *r){
 /* ------------------------------------------------------------------ */
 
 #define SHF_EXECINSTR 0x4
-#define MAX_INS_PER_ROOM 640
+/* No cap: a room is sized for its whole function, so showing only the
+   first N instructions leaves most of the floor bare.  Only one room is
+   decoded at a time, and the largest function in /usr/bin is ~5000
+   instructions, so this is under a megabyte of Insn.                    */
+#define MAX_INS_PER_ROOM 0
 
 int room_is_code(const Building *b, const Room *r){
+    /* A chamber is not one run of code -- it holds several unrelated units,
+       and decoding r->data would disassemble the first one across the whole
+       room.  Its alcoves are entered individually, via city_enter_unit().  */
     return b && r && b->sec && (b->sec->flags & SHF_EXECINSTR) &&
-           r->data && r->datasz > 0 && r->kind != RT_EMPTY && r->kind != RT_LIST;
+           r->data && r->datasz > 0 &&
+           r->kind != RT_EMPTY && r->kind != RT_LIST && r->kind != RT_GROUP;
+}
+
+int unit_is_code(const Building *b, const Unit *u){
+    return b && u && b->sec && (b->sec->flags & SHF_EXECINSTR) &&
+           u->data && u->datasz > 0;
 }
 
 /* which room, if any, currently holds a decoding */
@@ -410,8 +423,26 @@ void city_leave_room(City *c){
         Room *r = &g_openBld->rooms[g_openRoom];
         disasm_free(r->dis);
         r->dis = NULL;
+        r->activeUnit = -1;
     }
     g_openBld = NULL; g_openRoom = -1;
+}
+
+/* decode one alcove of a chamber */
+void city_enter_unit(City *c, int bi, int ri, int ui){
+    if (bi < 0 || bi >= c->nbld) return;
+    Building *b = &c->bld[bi];
+    if (ri < 0 || ri >= b->nrooms) return;
+    Room *r = &b->rooms[ri];
+    if (ui < 0 || ui >= r->nunits || !r->units){ city_leave_room(c); return; }
+    if (g_openBld == b && g_openRoom == ri && r->activeUnit == ui) return;
+    city_leave_room(c);
+    Unit *u = &r->units[ui];
+    if (!unit_is_code(b, u)) return;
+    uint64_t n = u->datasz;
+    if (u->size && n > u->size) n = u->size;
+    r->dis = disasm_run(u->data, n, u->addr ? u->addr : u->fileoff, MAX_INS_PER_ROOM);
+    if (r->dis){ g_openBld = b; g_openRoom = ri; r->activeUnit = ui; }
 }
 
 void city_enter_room(City *c, int bi, int ri){
@@ -480,10 +511,22 @@ static int room_tiles(const Elf *e, const Room *r){
     uint64_t n;
     switch (r->kind){
     case RT_FUNC: {
-        int avg = 4;                               /* x86-64 mean length */
-        if (e->machine == 40) avg = 4;             /* ARM   */
-        if (e->machine == 183) avg = 4;            /* AArch64 */
-        n = (r->size + (uint64_t)avg - 1) / (uint64_t)avg;
+        /* Bytes per instruction.  A single constant cannot fit both ends:
+           measured over 1500 git rooms, short functions run about 3.2 B an
+           instruction (prologue and epilogue are one and two byte ops)
+           while the largest run 5.2 (SSE, long displacements).  So take it
+           as rising with the log of the size, and sit a little under the
+           measurement so the grid still holds the decode.                */
+        if (e->machine == 40 || e->machine == 183){          /* fixed width */
+            n = (r->size + 3) / 4;
+        } else if (e->machine == 243){                        /* RISC-V     */
+            n = (r->size + 2) / 3;
+        } else {                                              /* x86, x86-64 */
+            double bpi = 2.9 + 0.20 * (log((double)(r->size ? r->size : 1) / 64.0) / log(2.0));
+            if (bpi < 2.8) bpi = 2.8;
+            if (bpi > 5.0) bpi = 5.0;
+            n = (uint64_t)((double)r->size / bpi) + 1;
+        }
         break; }
     case RT_LIST:   n = r->hi > r->lo ? r->hi - r->lo : 1; break;
     case RT_EMPTY:  n = 1; break;
@@ -541,6 +584,7 @@ static int group_small(Room **rp, int n){
         Room *c = &out[m++];
         memset(c, 0, sizeof *c);
         c->kind = RT_GROUP; c->symidx = -1; c->linkPrev = c->linkNext = -1;
+        c->activeUnit = -1;
         c->units = malloc((size_t)k * sizeof(Unit));
         c->nunits = k;
         int maxt = 1; uint64_t lo = UINT64_MAX, tot = 0;

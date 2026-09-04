@@ -46,7 +46,7 @@ static int load_file(App *a, const char *path){
     disasm_close();
     if (a->elf) elf_close(a->elf);
     a->elf = e; a->city = c;
-    a->lastB = a->lastR = -2; a->nearIns = -1;
+    a->lastB = a->lastR = a->lastU = -2; a->nearIns = -1;
     if (!disasm_open(e->machine, e->is64, e->be))
         fprintf(stderr, "note: no disassembler for %s; code rooms show raw bytes\n",
                 elf_machine_name(e->machine));
@@ -145,10 +145,20 @@ static void browser_open(App *a){
 
 static void room_lifecycle(App *a){
     int bi = a->p.inside, ri = a->p.room;
-    if (bi != a->lastB || ri != a->lastR){
-        if (bi >= 0 && ri >= 0) city_enter_room(a->city, bi, ri);
-        else                    city_leave_room(a->city);
-        a->lastB = bi; a->lastR = ri;
+    /* a chamber holds several units: decode the alcove being stood at, and
+       swap when the visitor moves to another one                          */
+    int ui = -1;
+    if (bi >= 0 && ri >= 0){
+        Building *b = &a->city->bld[bi];
+        if (ri < b->nrooms && b->rooms[ri].kind == RT_GROUP)
+            ui = room_unit_at(b, &b->rooms[ri], a->p.x, a->p.z);
+    }
+    if (bi != a->lastB || ri != a->lastR || ui != a->lastU){
+        if (bi >= 0 && ri >= 0){
+            if (ui >= 0) city_enter_unit(a->city, bi, ri, ui);
+            else         city_enter_room(a->city, bi, ri);
+        } else city_leave_room(a->city);
+        a->lastB = bi; a->lastR = ri; a->lastU = ui;
         a->nearIns = -1;
     }
     /* which sculpture are we standing next to? */
@@ -462,6 +472,38 @@ static int shot_mode(App *a, const char *dir){
         shot(a, dir, "12-code-close");
     }
 
+    /* a chamber: seven small units around an open middle, the one you are
+       standing at decoded into sculpture */
+    {
+        int gb = -1, gr = -1;
+        for (int i = 0; i < c->nbld && gb < 0; i++){
+            Building *bb2 = &c->bld[i];
+            if (!bb2->sec || !(bb2->sec->flags & 0x4)) continue;
+            for (int k = 0; k < bb2->nrooms; k++)
+                if (bb2->rooms[k].kind == RT_GROUP && bb2->rooms[k].nunits >= 6){
+                    gb = i; gr = k; break;
+                }
+        }
+        if (gb >= 0){
+            Building *bb2 = &c->bld[gb];
+            Room *rr = &bb2->rooms[gr];
+            stand_in_room(a, gb, gr);
+            float x0, z0, x1, z1;
+            if (room_cell_rect(bb2, rr, 0, &x0, &z0, &x1, &z1)){
+                a->p.x = (x0 + x1) * 0.5f + 1.4f;
+                a->p.z = (z0 + z1) * 0.5f + 1.4f;
+            }
+            a->p.pitch = -0.32f;
+            a->p.inside = gb; a->p.floor = rr->floor; a->p.room = gr;
+            room_lifecycle(a);
+            shot(a, dir, "14-chamber");
+            printf("  chamber '%s': %d units, active alcove %d, %s\n",
+                   rr->title, rr->nunits, rr->activeUnit,
+                   rr->dis ? "alcove decoded" : "NOT decoded");
+            city_leave_room(c);
+        }
+    }
+
     a->showMap = 1; a->showDetail = 1; a->showHelp = 1;
     shot(a, dir, "13-overlays");
     return 0;
@@ -474,7 +516,7 @@ int main(int argc, char **argv){
     a->winw = 1440; a->winh = 900;
     a->showMap = 1;
     a->p.inside = -1; a->p.room = -1;
-    a->lastB = a->lastR = -2; a->nearIns = -1;
+    a->lastB = a->lastR = a->lastU = -2; a->nearIns = -1;
 
     const char *start = NULL, *shotdir = NULL;
     int dotest = 0, dobench = 0, dostats = 0;
@@ -600,6 +642,26 @@ int main(int argc, char **argv){
                 for (int k = 0; k < 6; k++)
                     if (okind[k]) printf("      %-7s sampled %4d, decoded %4d, overflowing grid %4d\n",
                                          KN[k], okind[k], decoded[k], ovkind[k]);
+                {   /* per-room mean instruction length: the low tail is what
+                       decides how many tiles a room needs                    */
+                    float *bpi = malloc((size_t)no * sizeof(float)); int nb = 0;
+                    for (int x = 0; x < no && nb < 1500; x++){
+                        city_enter_room(c, bb, ord[x]);
+                        Room *r = &b->rooms[ord[x]];
+                        if (r->dis && !r->dis->truncated && r->dis->n > 3)
+                            bpi[nb++] = (float)r->dis->covered / r->dis->n;
+                        city_leave_room(c);
+                    }
+                    for (int x = 1; x < nb; x++){          /* insertion sort */
+                        float t = bpi[x]; int y = x - 1;
+                        while (y >= 0 && bpi[y] > t){ bpi[y+1] = bpi[y]; y--; }
+                        bpi[y+1] = t;
+                    }
+                    if (nb) printf("  per-room bytes/instruction over %d rooms:"
+                        " p1 %.2f  p5 %.2f  p10 %.2f  p25 %.2f  median %.2f\n", nb,
+                        bpi[nb/100], bpi[nb/20], bpi[nb/10], bpi[nb/4], bpi[nb/2]);
+                    free(bpi);
+                }
                 {   /* the real mean instruction length, from rooms that fit */
                     uint64_t bytes = 0; long insns = 0; int sample = 0;
                     for (int x = 0; x < no && sample < 600; x++){

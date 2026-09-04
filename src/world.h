@@ -12,6 +12,12 @@ void emit_shell(const Building *b, BoxSink f, void *ud);
 void emit_floor(const Building *b, int fl, BoxSink f, void *ud);
 void emit_ceiling(const Building *b, int fl, BoxSink f, void *ud);
 
+/* chamber alcoves: the 3x3 grid, less the middle and the doorway.  Shared
+   so the renderer and the walk-in logic agree on where a unit lives.     */
+int  room_cell_rect(const Building *b, const Room *r, int u,
+                    float *x0, float *z0, float *x1, float *z1);
+int  room_unit_at(const Building *b, const Room *r, float wx, float wz);
+
 /* spiral stair: tread top height at a point, or -1e9 if not over a tread */
 float stair_height(const Building *b, float wx, float wz, float curY);
 void  stair_center(const Building *b, float *cx, float *cz);
