@@ -285,7 +285,7 @@ void hud_draw(App *a){
         float pw = 860, ph = 430, px = w/2.0f - pw/2, py = h/2.0f - ph/2;
         panel(px, py, pw, ph, 0.03f, 0.04f, 0.06f, 0.92f);
         glColor4f(1.0f, 0.92f, 0.60f, 1);
-        text_2d(FNT_SIGN, px + 24, py + 16, 26, "ELF CITY -- controls");
+        text_2d(FNT_SIGN, px + 24, py + 16, 26, "CODE CITY -- controls");
         float y = py + 60;
         for (int i = 0; HELP[i]; i++){
             if (!HELP[i][0]){ y += 10; continue; }

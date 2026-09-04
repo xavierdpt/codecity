@@ -1,4 +1,4 @@
-/* model.h -- shared data model for the ELF city explorer */
+/* model.h -- shared data model for the Code City explorer */
 #ifndef MODEL_H
 #define MODEL_H
 

@@ -1,4 +1,4 @@
-# ELF City -- a 3D file explorer for binaries
+# Code City -- a 3D file explorer for binaries
 CC      ?= gcc
 PKGS     = sdl2 SDL2_ttf gl glu capstone
 CFLAGS  ?= -O2 -g
@@ -7,7 +7,7 @@ LDLIBS   = $(shell pkg-config --libs $(PKGS)) -lm
 
 SRC = src/elfload.c src/ehframe.c src/disasm.c src/city.c src/world.c src/text.c src/render.c src/hud.c src/main.c
 OBJ = $(SRC:.c=.o)
-BIN = elfcity
+BIN = codecity
 
 all: $(BIN)
 

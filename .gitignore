@@ -1,5 +1,5 @@
 # build output
-elfcity
+codecity
 *.o
 
 # screenshots from --shot

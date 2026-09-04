@@ -2,11 +2,11 @@
 
 > **Implemented.** All of it, in `src/ehframe.[ch]` (new) and
 > `model.h`, `city.c`, `world.c`, `render.c`, `main.c`, `hud.c`.
-> `./elfcity --stats FILE` prints the layout the packer produced.
+> `./codecity --stats FILE` prints the layout the packer produced.
 >
 > | | rooms | chambers (units) | recovered | tallest | far plane |
 > |---|---|---|---|---|---|
-> | `elfcity` | 291 | 138 (934) | 3 | 26 m / 6 fl | 1904 m |
+> | `codecity` | 291 | 138 (934) | 3 | 26 m / 6 fl | 1904 m |
 > | `git` (stripped) | 3156 | 568 (3959) | 2335 | 1058 m / 264 fl | 2189 m |
 > | `ssh` (stripped) | 643 | 116 (798) | 402 | 182 m / 45 fl | 1854 m |
 > | `busybox` (static) | 1948 | 525 (3647) | 1401 | 726 m / 181 fl | 1949 m |
@@ -186,7 +186,7 @@ Both are clamped below at a minimum walkable room, about 2.6 × 2.4 m.
 ### How big may the biggest room be?
 
 Strictly linear area over the real range of function sizes does not survive contact with
-a walking camera. In `elfcity`'s own `.text`: median function 214 bytes, 95th percentile
+a walking camera. In `codecity`'s own `.text`: median function 214 bytes, 95th percentile
 5895, maximum 13577 — a 63:1 span within one section, and across a whole binary it is
 worse. At one tile per instruction and 0.55 m per tile, the largest function alone would
 be a 29 × 30 m room.
@@ -234,7 +234,7 @@ the short version is that plate-from-largest builds the same city in **a third o
 volume** at **four times the fill**.
 
 It also has a property worth having for its own sake: function sizes are heavily skewed —
-in `elfcity`'s `.text`, the median function is 214 bytes and the largest is 13577, and the
+in `codecity`'s `.text`, the median function is 214 bytes and the largest is 13577, and the
 largest *room* is 32× the median room by area. A distribution with a few huge items and a
 long tail of small ones is the best case for first-fit-decreasing: the big items define the
 shape, and there is always something small enough to drop into the leftover. Uniform item
@@ -263,7 +263,7 @@ Both bounds are load-bearing, each in a different regime:
 
 | Section | largest-room bound | 10-room quota bound | binds |
 |---|---|---|---|
-| `elfcity .text`, skewed | 1166 m² | 370 m² | largest room |
+| `codecity .text`, skewed | 1166 m² | 370 m² | largest room |
 | stripped `.text`, uniform | 382 m² | 3820 m² | quota |
 
 ### The algorithm — shelf rows, big first
@@ -310,7 +310,7 @@ Two details that matter more than they look:
   Letting a row deepen while the plate still allows it is four lines and worth several
   percent of fill.
 - **Sort by area, not width.** Because §2 makes both sides scale as `√n`, sorting by area,
-  by width, or by depth-then-width produced *identical* packings on `elfcity`'s 98
+  by width, or by depth-then-width produced *identical* packings on `codecity`'s 98
   functions. Area is the one that also happens to be the right tiebreak for the row-growth
   rule, so use it and stop thinking about it.
 
@@ -325,7 +325,7 @@ a floor being a bag of rooms and a floor being a neighbourhood.
 A room holding four instructions is not worth walking into, and there are a lot of them.
 The distribution is lopsided in a useful way — measured on FDE-recovered functions:
 
-| | `git` | `ssh` | `elfcity` |
+| | `git` | `ssh` | `codecity` |
 |---|---|---|---|
 | functions | 4472 | 704 | 93 |
 | median size | 271 B | 302 B | 218 B |
@@ -387,7 +387,7 @@ where grouping starts costing footprint instead of saving it.
 
 ### The trade-off, measured
 
-`elfcity`'s `.text`, 98 functions, floor-count lower bound `ceil(98/10) = 10`, largest room
+`codecity`'s `.text`, 98 functions, floor-count lower bound `ceil(98/10) = 10`, largest room
 34.5 × 33.8 m. `slack` is the multiplier on the plate area `A` above:
 
 | slack | plate | floors | room fill | corridor | volume |
@@ -420,7 +420,7 @@ Read it honestly:
 ### The one pathological case
 
 A single enormous unit — a generated parser, a table-driven state machine — drags the plate
-with it. Simulated: adding one 500 KiB function to `elfcity`'s 98 blows the plate to
+with it. Simulated: adding one 500 KiB function to `codecity`'s 98 blows the plate to
 250 × 250 m and drops room fill to 7.8%, because one room needs a floor that 97 others
 rattle around in.
 
@@ -659,7 +659,7 @@ Measured across **`/usr/bin`** — 1120 ELF64 executables with a `.text` over 4 
 That is **898 813 function boundaries recovered for free** across the directory, median 40
 functions per binary, largest 50 401.
 
-And the boundaries are not approximate. Cross-checked against `elfcity`'s own symbol table:
+And the boundaries are not approximate. Cross-checked against `codecity`'s own symbol table:
 
 ```
 real FUNC symbols in .text : 93
@@ -720,7 +720,7 @@ no disassembler at all:
   binaries) this marks every indirect-branch target, which includes every address-taken
   function.
 
-Scored against `elfcity`'s 93 known functions:
+Scored against `codecity`'s 93 known functions:
 
 | seed source | found | recall | precision |
 |---|---|---|---|
@@ -841,7 +841,7 @@ That leaves one thing that must actually be fixed, and it is not what it looks l
 obvious reading is that tall towers overrun it. They do — but the dominant term is the
 **ground quad**, drawn 400 m beyond the city bounding box on every side
 (`float m = 400.0f`, `src/render.c:158`). That skirt alone puts the far corner of the world
-1281 m from the near corner *for `elfcity`*, a binary with 13-floor buildings. The current
+1281 m from the near corner *for `codecity`*, a binary with 13-floor buildings. The current
 1600 m has been marginal all along; towers only make it obvious.
 
 ```c
@@ -859,7 +859,7 @@ already has the `App`, so the city is in reach — this is a one-line change at 
 
 | | ground W | ground D | height | diagonal | far plane |
 |---|---|---|---|---|---|
-| `elfcity` | 920 m | 890 m | 52 m | 1281 m | 1395 m |
+| `codecity` | 920 m | 890 m | 52 m | 1281 m | 1395 m |
 | `git`, grouped | 1178 m | 1029 m | 1192 m | 1967 m | 2115 m |
 | `git`, ungrouped | 1178 m | 1029 m | 1904 m | 2464 m | 2637 m |
 | a 50 MB binary | 1700 m | 1400 m | 6000 m | 6391 m | 6761 m |
@@ -891,7 +891,7 @@ show it in the building panel: if it ever does, it is a bug rather than a policy
 
 **Buildings get squatter, and the city grows.** Today a building is `CORE_W + len` by
 `CORR_W + 2·ROOM_D` = up to 98 × 17 m — a long thin slab. A plate is near-square and, for
-`elfcity`'s `.text`, 39 × 38 m. Deeper, but *much* shorter, and the volume goes down, not
+`codecity`'s `.text`, 39 × 38 m. Deeper, but *much* shorter, and the volume goes down, not
 up. The district packer `pack()` (`src/city.c:510`) already shelf-packs on `b->w`/`b->d`,
 so the city layout absorbs this with no change — but it was tuned against slabs, and
 near-square blocks will shelf differently. Look at `gapx = 10, gapz = 16` afterwards.
@@ -902,7 +902,7 @@ every door within sight of the spine. The stair core is at one corner (`stair_ce
 `src/world.c:12`), so the far corner of a plate is ~50 m of corridor away. If that grates,
 the fix is not a smaller plate — it is a second stair.
 
-**Rooms with zero content.** `elfcity`'s own symbol table contains functions with
+**Rooms with zero content.** `codecity`'s own symbol table contains functions with
 `size = 0`. `ntiles` clamps to 1, `tile_rect(1)` gives 2 × 2, and the minimum-room clamp
 gives a 2.6 × 2.4 m closet. Correct behaviour — just make sure the clamp is there,
 because a `0 × 0` room would divide by zero in the row-frontage sum.

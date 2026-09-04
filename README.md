@@ -1,4 +1,4 @@
-# ELF City — a 3D file explorer for binaries
+# Code City — a 3D file explorer for binaries
 
 <https://github.com/xavierdpt/codecity>
 
@@ -23,8 +23,8 @@ is `src/elfload.c`.
 
 ```sh
 make
-./elfcity /usr/lib/x86_64-linux-gnu/libc.so.6
-./elfcity                 # defaults to /bin/ls
+./codecity /usr/lib/x86_64-linux-gnu/libc.so.6
+./codecity                 # defaults to /bin/ls
 ```
 
 Needs `libsdl2-dev`, `libsdl2-ttf-dev`, `libgl-dev`, `libglu1-mesa-dev`,
@@ -139,13 +139,13 @@ is ever allocated, which `--selftest` asserts.
 ## Headless modes
 
 ```sh
-./elfcity FILE --selftest   # walks in the front door, up the spiral to floor 3, back
+./codecity FILE --selftest   # walks in the front door, up the spiral to floor 3, back
                             # down one, along the corridor and through a room door, for
                             # the first 8 towers; also asserts that entering a room
                             # allocates exactly one decoding and leaving frees it.
                             # Non-zero exit on failure.
-./elfcity FILE --shot DIR   # renders thirteen canned viewpoints to DIR/*.ppm
-./elfcity FILE --bench      # frame time in the busiest code room it can find
+./codecity FILE --shot DIR   # renders thirteen canned viewpoints to DIR/*.ppm
+./codecity FILE --bench      # frame time in the busiest code room it can find
 ```
 
 `--selftest` passes on 60 binaries and libraries from `/usr/bin` and
@@ -425,7 +425,7 @@ here as an implementation.
 Some things that make a change easy to take:
 
 - `make` should stay warning-free with `-Wall -Wextra`.
-- `./elfcity FILE --selftest` should still pass. It is cheap to run over a lot of
+- `./codecity FILE --selftest` should still pass. It is cheap to run over a lot of
   files at once, and it catches broken geometry and leaked room decodings that
   are invisible from a screenshot.
 - If you add something visual, `--shot` is the quickest way to show what it looks

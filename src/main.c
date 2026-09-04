@@ -1,4 +1,4 @@
-/* main.c -- ELF City: walk around the inside of a binary */
+/* main.c -- Code City: walk around the inside of a binary */
 #define _GNU_SOURCE
 #include "app.h"
 #include "disasm.h"
@@ -694,13 +694,13 @@ int main(int argc, char **argv){
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
-    SDL_Window *win = SDL_CreateWindow("ELF City -- a 3D file explorer",
+    SDL_Window *win = SDL_CreateWindow("Code City -- a 3D file explorer",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, a->winw, a->winh,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | ((shotdir||dotest||dobench) ? SDL_WINDOW_HIDDEN : 0));
     if (!win){
         SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 0);
         SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 0);
-        win = SDL_CreateWindow("ELF City -- a 3D file explorer",
+        win = SDL_CreateWindow("Code City -- a 3D file explorer",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, a->winw, a->winh,
             SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | (shotdir ? SDL_WINDOW_HIDDEN : 0));
     }
