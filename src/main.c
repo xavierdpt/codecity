@@ -557,7 +557,66 @@ int main(int argc, char **argv){
                            b->h / b->plateW, (float)b->nrooms / b->nfloors);
                 }
             }
-            printf("rooms per floor:");
+            {   /* what the sculpture cap does to the biggest code rooms */
+            int bb = -1;
+            for (int i = 0; i < c->nbld; i++){
+                Building *b = &c->bld[i];
+                if (!b->sec || !(b->sec->flags & 0x4)) continue;
+                if (bb < 0 || b->nrooms > c->bld[bb].nrooms) bb = i;
+            }
+            if (bb >= 0){
+                Building *b = &c->bld[bb];
+                int *ord = malloc((size_t)b->nrooms * sizeof(int)), no = 0;
+                for (int k = 0; k < b->nrooms; k++)
+                    if (room_is_code(b, &b->rooms[k])) ord[no++] = k;
+                for (int x = 0; x < no; x++)          /* partial sort: top 4 */
+                    for (int y = x + 1; y < no && x < 4; y++)
+                        if (b->rooms[ord[y]].size > b->rooms[ord[x]].size){
+                            int t = ord[x]; ord[x] = ord[y]; ord[y] = t; }
+                printf("\nbiggest %s rooms (grid is what the room was sized for):\n", b->label);
+                for (int x = 0; x < no && x < 4; x++){
+                    city_enter_room(c, bb, ord[x]);
+                    Room *r = &b->rooms[ord[x]];
+                    int n = r->dis ? r->dis->n : 0;
+                    printf("  %-14s %8llu B  grid %3dx%-3d = %6d tiles  decoded %4d  %-9s  covered %3.0f%%\n",
+                           r->title, (unsigned long long)r->size, r->tw, r->th,
+                           r->tw * r->th, n,
+                           (r->dis && r->dis->truncated) ? "TRUNCATED" : "complete",
+                           100.0 * n / (r->tw * r->th));
+                    city_leave_room(c);
+                }
+                /* and the other end: do small rooms overflow their grid? */
+                int over = 0, tot = 0, okind[6] = {0}, ovkind[6] = {0}, decoded[6] = {0};
+                for (int x = no - 1; x >= 0 && tot < 400; x--, tot++){
+                    city_enter_room(c, bb, ord[x]);
+                    Room *r = &b->rooms[ord[x]];
+                    okind[r->kind]++;
+                    if (r->dis) decoded[r->kind]++;
+                    if (r->dis && r->dis->n > r->tw * r->th){ over++; ovkind[r->kind]++; }
+                    city_leave_room(c);
+                }
+                static const char *KN[6] = {"FUNC","OBJECT","LIST","BYTES","EMPTY","GROUP"};
+                printf("  of %d code rooms sampled, %d hold more instructions than tiles\n", tot, over);
+                for (int k = 0; k < 6; k++)
+                    if (okind[k]) printf("      %-7s sampled %4d, decoded %4d, overflowing grid %4d\n",
+                                         KN[k], okind[k], decoded[k], ovkind[k]);
+                {   /* the real mean instruction length, from rooms that fit */
+                    uint64_t bytes = 0; long insns = 0; int sample = 0;
+                    for (int x = 0; x < no && sample < 600; x++){
+                        city_enter_room(c, bb, ord[x]);
+                        Room *r = &b->rooms[ord[x]];
+                        if (r->dis && !r->dis->truncated && r->dis->n){
+                            bytes += r->dis->covered; insns += r->dis->n; sample++;
+                        }
+                        city_leave_room(c);
+                    }
+                    if (insns) printf("  mean instruction length over %d complete rooms: %.2f bytes"
+                                      " (room sizing assumes 4.00)\n", sample, (double)bytes / insns);
+                }
+                free(ord);
+            }
+        }
+        printf("rooms per floor:");
             for (int k = 1; k <= 10; k++) if (hist[k]) printf("  %d:%d", k, hist[k]);
             printf("   (%d floors, %d outside 1..%d)\n", tot, bad, MAXPF);
         }
