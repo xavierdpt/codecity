@@ -94,7 +94,7 @@ const char *elf_reltype_name(int machine, uint32_t t);
 
 /* architectural constants (metres) */
 #define FLOOR_H     4.0f    /* floor-to-floor                         */
-#define ROOM_D      6.5f    /* room depth, each side of the corridor  */
+#define ROOM_D      6.5f    /* legacy fixed room depth (plaza props)  */
 #define CORR_W      4.0f    /* corridor width                         */
 #define WALL_T      0.30f   /* wall thickness                         */
 #define CORE_W      8.0f    /* stair-core footprint (square)          */
@@ -104,12 +104,39 @@ const char *elf_reltype_name(int machine, uint32_t t);
 #define STAIR_ROUT  3.30f   /* spiral stair outer radius              */
 #define STEPS_PER_FLOOR 16
 
+/* content grid: one tile is one unit of content (an instruction, a 16-byte
+   line, a printed row).  Rooms are sized from their tile count.          */
+#define TILE_M      0.55f   /* metres per tile, before per-building scaling */
+#define TILE_MIN    0.22f
+#define TILE_MARGIN 0.70f   /* clear strip between the grid and the walls   */
+#define TILE_SETBACK 1.20f  /* clear strip inside the door                  */
+#define ROOM_W_MIN  2.60f
+#define ROOM_D_MIN  2.40f
+#define MAXPF       10      /* rooms per floor, hard cap                    */
+#define PLATE_FILL  0.62f   /* assumed packing efficiency when sizing a plate */
+#define GROUP_TILES 64      /* units at or below this share a chamber       */
+#define GROUND_MARGIN 400.0f/* how far the ground quad runs past the city   */
+
+/* one piece of content: a function, an object, a slice of a table.  A plain
+   room holds exactly one and mirrors it in its own fields; a chamber holds
+   several, one per cell of a 3x3 grid with the middle left open.          */
+typedef struct Unit {
+    uint64_t    addr, size, fileoff;
+    const uint8_t *data;
+    uint64_t    datasz;
+    int         symidx;
+    int         cell;               /* 0..7 around the 3x3, -1 if whole room */
+    int         ntiles, tw, th;
+    char        title[96];
+} Unit;
+
 typedef enum {
     RT_FUNC,      /* a function: byte columns + plaque      */
     RT_OBJECT,    /* a data object: crates                  */
     RT_LIST,      /* a table slice: text lines on shelves   */
     RT_BYTES,     /* raw bytes: voxel wall                  */
-    RT_EMPTY      /* NOBITS / nothing here                  */
+    RT_EMPTY,     /* NOBITS / nothing here                  */
+    RT_GROUP      /* a chamber of small units around an open middle */
 } RoomKind;
 
 /* how a RT_LIST room regenerates its text lines on demand */
@@ -123,9 +150,15 @@ typedef struct Room {
     const uint8_t *data;            /* content bytes, may be NULL */
     uint64_t    datasz;
 
-    int         floor, side;        /* side 0 = -Z, 1 = +Z */
-    float       x0, x1;             /* extent along the corridor  */
+    int         floor, row;         /* which floor, which comb row */
+    float       x0, x1;             /* plate-local rect, along the row   */
+    float       z0, z1;             /* z0 is the wall the door is in     */
     int         symidx;             /* -1 if none */
+
+    int         ntiles, tw, th;     /* content grid, in tiles            */
+    int         cellw, cellh;       /* chamber cell size; 0 if not RT_GROUP */
+    Unit       *units;              /* NULL when the room is its own unit */
+    int         nunits;
 
     int         linkPrev, linkNext; /* interior doors to neighbours */
 
@@ -152,7 +185,9 @@ typedef struct Building {
     int         truncated;          /* rooms dropped for size */
 
     float       bx, bz;             /* world position of local origin  */
-    float       len;                /* corridor length (local x 0..len)*/
+    float       plateW, plateD;     /* the floor plate, every floor alike */
+    float       tile;               /* metres per content tile         */
+    float       len;                /* == plateW, kept for the exterior */
     float       w, d, h;            /* overall footprint + height      */
     float       col[3];
 
@@ -173,6 +208,7 @@ typedef struct City {
     int        nportal;
     float      minx, maxx, minz, maxz;
     float      plazaR;
+    float      farPlane;            /* derived from the city's extent  */
     int        dcount[DK_COUNT];
     float      dmin[DK_COUNT][2], dmax[DK_COUNT][2];
 } City;
@@ -190,8 +226,14 @@ const char *elf_sym_at(const Elf *e, uint64_t addr, uint64_t *off);
 
 /* geometry helpers shared by render + collision */
 static inline float bld_x0(const Building *b) { return b->bx - CORE_W; }
-static inline float bld_x1(const Building *b) { return b->bx + b->len; }
-static inline float bld_z0(const Building *b) { return b->bz - (CORR_W*0.5f + ROOM_D); }
-static inline float bld_z1(const Building *b) { return b->bz + (CORR_W*0.5f + ROOM_D); }
+static inline float bld_x1(const Building *b) { return b->bx + b->plateW; }
+static inline float bld_z0(const Building *b) { return b->bz - b->plateD * 0.5f; }
+static inline float bld_z1(const Building *b) { return b->bz + b->plateD * 0.5f; }
+
+/* a room's rect in world coordinates */
+static inline float room_x0(const Building *b, const Room *r){ return b->bx + r->x0; }
+static inline float room_x1(const Building *b, const Room *r){ return b->bx + r->x1; }
+static inline float room_z0(const Building *b, const Room *r){ return bld_z0(b) + r->z0; }
+static inline float room_z1(const Building *b, const Room *r){ return bld_z0(b) + r->z1; }
 
 #endif

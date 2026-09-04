@@ -242,12 +242,12 @@ static void draw_stair(const Building *b, int f0, int f1){
 /* ------------------------------------------------------------------ */
 
 /* geometry of a room's inner box */
+/* the room's own rect; the door is always in the z0 wall, so the interior
+   always runs toward +Z and nz is always +1                              */
 static void room_bounds(const Building *b, const Room *r, float *x0, float *x1,
                         float *zNear, float *zFar, float *nz){
-    float cw = CORR_W * 0.5f;
-    *x0 = b->bx + r->x0 + WALL_T; *x1 = b->bx + r->x1 - WALL_T;
-    if (r->side == 0){ *zFar = bld_z0(b) + WALL_T; *zNear = b->bz - cw - WALL_T; *nz = 1.0f; }
-    else             { *zFar = bld_z1(b) - WALL_T; *zNear = b->bz + cw + WALL_T; *nz = -1.0f; }
+    *x0 = room_x0(b, r); *x1 = room_x1(b, r);
+    *zNear = room_z0(b, r); *zFar = room_z1(b, r); *nz = 1.0f;
 }
 
 static void wall_text(int font, float x, float y, float z, float nz, float h,
@@ -292,29 +292,32 @@ static float class_lift(int c){
 }
 
 /* serpentine ribbon across the room floor, so consecutive instructions touch */
-static void layout_code(Disasm *d, float x0, float x1, float zn, float zf, float base){
+static void layout_code(Disasm *d, const Building *b, float x0, float x1,
+                        float zn, float zf, float base){
     float dir = (zf > zn) ? 1.0f : -1.0f;
-    float usableW = x1 - x0 - 0.9f;
-    float usableD = fabsf(zf - zn) - 3.0f;
+    float usableW = x1 - x0 - 2 * TILE_MARGIN;
+    float usableD = fabsf(zf - zn) - TILE_SETBACK - TILE_MARGIN;
     if (usableW < 1.0f) usableW = 1.0f;
     if (usableD < 1.0f) usableD = 1.0f;
-    float pitch = 0.80f;
+    /* the room was sized from one tile per instruction, so start there
+       and only shrink if the real decode came out longer than estimated */
+    float pitch = b->tile;
     int cols = 1, rows = 1;
     for (;;){
         cols = (int)(usableW / pitch); if (cols < 1) cols = 1;
         rows = (int)(usableD / pitch); if (rows < 1) rows = 1;
-        if (cols * rows >= d->n || pitch <= 0.235f) break;
+        if (cols * rows >= d->n || pitch <= 0.20f) break;
         pitch *= 0.93f;
     }
     d->pitch = pitch; d->cols = cols; d->rows = rows;
-    float gx = x0 + 0.45f + (usableW - cols * pitch) * 0.5f;
+    float gx = x0 + TILE_MARGIN + (usableW - cols * pitch) * 0.5f;
     for (int i = 0; i < d->n; i++){
         Insn *t = &d->ins[i];
         int row = i / cols, col = i % cols;
         if (row & 1) col = cols - 1 - col;               /* boustrophedon */
         if (row >= rows) row = rows - 1;                 /* overflow piles on the last row */
         t->x = gx + (col + 0.5f) * pitch;
-        t->z = zn + dir * (2.3f + (row + 0.5f) * pitch);
+        t->z = zn + dir * (TILE_SETBACK + (row + 0.5f) * pitch);
         t->y = base;
         t->h = clampf(0.22f + t->len * 0.075f + class_lift(t->cls), 0.06f, 1.55f);
     }
@@ -395,14 +398,14 @@ static void draw_code_room(const Building *b, const Room *r, App *a,
                            float x0, float x1, float zn, float zf, float nz, float base){
     Disasm *d = r->dis;
     if (!d || !d->n) return;
-    if (!d->laid) layout_code(d, x0, x1, zn, zf, base);
+    if (!d->laid) layout_code(d, b, x0, x1, zn, zf, base);
 
     float px = a->p.x, py = a->p.y, pz = a->p.z;
     float now = a->now;
 
     /* the plinth the whole thing stands on */
     glColor3f(0.26f, 0.26f, 0.29f);
-    float pz0 = zn + (nz > 0 ? -2.0f : 2.0f), pz1 = zf;
+    float pz0 = zn + (nz > 0 ? -0.2f : 0.2f), pz1 = zf;
     if (pz0 > pz1){ float t = pz0; pz0 = pz1; pz1 = t; }
     draw_box(x0 + 0.2f, base, pz0, x1 - 0.2f, base + 0.05f, pz1);
 
@@ -521,6 +524,102 @@ static void draw_code_room(const Building *b, const Room *r, App *a,
     glEnable(GL_LIGHTING);
 }
 
+/* ------------------------------------------------------------------ */
+/* content as a grid of tiles on the floor                             */
+/* ------------------------------------------------------------------ */
+
+/* one tile: colour and height for the k'th unit of content */
+static void tile_look(RoomKind kind, const uint8_t *data, uint64_t datasz,
+                      uint64_t total, int k, int n,
+                      float *cr, float *cg, float *cb, float *h){
+    if (kind == RT_EMPTY || !data || !datasz){
+        *cr = 0.30f; *cg = 0.34f; *cb = 0.40f; *h = 0.05f;
+        return;
+    }
+    /* spread n tiles over the room's bytes, and aggregate each tile's span */
+    uint64_t span = total > (uint64_t)n ? total / (uint64_t)n : 1;
+    uint64_t off = (uint64_t)k * span;
+    unsigned sum = 0, nz = 0, cnt = 0;
+    for (uint64_t q = 0; q < span && q < 16; q++){
+        if (off + q >= datasz) break;
+        unsigned char v = data[off + q];
+        sum += v; if (v) nz++; cnt++;
+    }
+    unsigned char rep = cnt ? (unsigned char)(sum / cnt) : 0;
+    byte_color(rep, cr, cg, cb);
+    float fill = cnt ? (float)nz / (float)cnt : 0.0f;
+    *h = 0.10f + fill * 0.45f + (rep / 255.0f) * 0.35f;
+}
+
+/* an extruded tile standing on the floor */
+static void tile_box(float x, float z, float s, float base, float h){
+    quad3(x-s,base,z+s, x+s,base,z+s, x+s,base+h,z+s, x-s,base+h,z+s, 0,0,1);
+    quad3(x+s,base,z-s, x-s,base,z-s, x-s,base+h,z-s, x+s,base+h,z-s, 0,0,-1);
+    quad3(x+s,base,z+s, x+s,base,z-s, x+s,base+h,z-s, x+s,base+h,z+s, 1,0,0);
+    quad3(x-s,base,z-s, x-s,base,z+s, x-s,base+h,z+s, x-s,base+h,z-s, -1,0,0);
+    quad3(x-s,base+h,z+s, x+s,base+h,z+s, x+s,base+h,z-s, x-s,base+h,z-s, 0,1,0);
+}
+
+/* a tw x th grid whose near-left corner is (gx, gz), running toward +Z */
+static void draw_grid(RoomKind kind, const uint8_t *data, uint64_t datasz,
+                      uint64_t total, int tw, int th, float gx, float gz,
+                      float pitch, float base, float maxh){
+    int n = tw * th;
+    if (n <= 0) return;
+    float s = pitch * 0.40f;
+    glBegin(GL_QUADS);
+    for (int k = 0; k < n; k++){
+        int ci = k % tw, ri = k / tw;
+        float cr, cg, cb, h;
+        tile_look(kind, data, datasz, total, k, n, &cr, &cg, &cb, &h);
+        if (h > maxh) h = maxh;
+        glColor3f(cr, cg, cb);
+        tile_box(gx + (ci + 0.5f) * pitch, gz + (ri + 0.5f) * pitch, s, base, h);
+    }
+    glEnd();
+}
+
+/* the room's content, on the floor.  One path for every kind that has
+   bytes, and a 3x3 of alcoves for a chamber.                          */
+static void draw_tiles(const Building *b, const Room *r, App *ap,
+                       float x0, float x1, float zn, float zf, float base){
+    float pitch = b->tile;
+    float maxh = pitch * 1.6f;
+    float availW = x1 - x0 - 2 * TILE_MARGIN;
+    float availD = zf - zn - TILE_SETBACK - TILE_MARGIN;
+
+    /* the plinth the content stands on */
+    glColor3f(0.26f, 0.26f, 0.29f);
+    draw_box(x0 + 0.2f, base, zn + 0.2f, x1 - 0.2f, base + 0.04f, zf - 0.2f);
+
+    if (r->kind == RT_GROUP && r->units){
+        float cellW = r->cellw * pitch, cellH = r->cellh * pitch;
+        float ox = x0 + TILE_MARGIN + (availW - 3 * cellW) * 0.5f;
+        float oz = zn + TILE_SETBACK + (availD - 3 * cellH) * 0.5f;
+        static const int CELL[7][2] = {{0,0},{2,0},{0,1},{2,1},{0,2},{1,2},{2,2}};
+        for (int u = 0; u < r->nunits && u < 7; u++){
+            const Unit *un = &r->units[u];
+            float gx = ox + CELL[u][0] * cellW, gz = oz + CELL[u][1] * cellH;
+            /* the alcove's own little plinth, so the cells read apart */
+            glColor3f(0.20f, 0.21f, 0.24f);
+            draw_box(gx, base + 0.04f, gz, gx + cellW - 0.06f, base + 0.07f, gz + cellH - 0.06f);
+            draw_grid(RT_FUNC, un->data, un->datasz, un->size ? un->size : un->datasz,
+                      un->tw, un->th, gx, gz, pitch, base + 0.07f, maxh);
+        }
+        return;
+    }
+
+    int tw = r->tw, th = r->th;
+    float gw = tw * pitch, gd = th * pitch;
+    if (gw > availW && availW > 0){ tw = (int)(availW / pitch); if (tw < 1) tw = 1; gw = tw * pitch; }
+    if (gd > availD && availD > 0){ th = (int)(availD / pitch); if (th < 1) th = 1; gd = th * pitch; }
+    float gx = x0 + TILE_MARGIN + (availW - gw) * 0.5f;
+    float gz = zn + TILE_SETBACK;
+    draw_grid(r->kind, r->data, r->datasz, r->size ? r->size : r->datasz,
+              tw, th, gx, gz, pitch, base + 0.04f, maxh);
+    (void)ap;
+}
+
 static void door_frame(float x, float z, float base, float dw, int side){
     float t = 0.09f;
     float z0 = z - t, z1 = z + t;
@@ -538,15 +637,14 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
     float base = r->floor * FLOOR_H;
     float w = x1 - x0;
     float mid = (x0 + x1) * 0.5f;
-    float depth = fabsf(zn - zf);
     float zmid = (zn + zf) * 0.5f;
     float dist = fabsf(px - mid) + fabsf(pz - zmid);
 
     /* doorway frame + nameplate above it, facing the corridor */
-    float plateZ = (r->side == 0) ? b->bz - CORR_W * 0.5f + 0.02f : b->bz + CORR_W * 0.5f - 0.02f;
-    float pnz = (r->side == 0) ? 1.0f : -1.0f;
-    float dwid = clampf(x1 - x0 + 2*WALL_T - 1.0f, 0.8f, DOOR_W);
-    door_frame(mid, plateZ - pnz * 0.16f, base, dwid, r->side);
+    float plateZ = zn - WALL_T - 0.02f;          /* the corridor face of the wall */
+    float pnz = -1.0f;                           /* the nameplate faces the corridor */
+    float dwid = clampf(x1 - x0 - 1.0f, 0.8f, DOOR_W);
+    door_frame(mid, zn - WALL_T * 0.5f, base, dwid, 0);
     glDisable(GL_LIGHTING);
     glColor3f(highlight ? 0.22f : 0.13f, highlight ? 0.26f : 0.14f, highlight ? 0.16f : 0.15f);
     float pw = clampf(w * 0.86f, 1.0f, 9.0f);
@@ -576,90 +674,27 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
     }
 
     switch (r->kind){
-    case RT_FUNC: {
-        /* the machine code laid out as a floor of byte columns */
-        float pitch = 0.46f;
-        int cols = (int)((w - 0.6f) / pitch); if (cols > 44) cols = 44; if (cols < 3) cols = 3;
-        int rows = (int)((depth - 3.2f) / pitch); if (rows > 8) rows = 8; if (rows < 1) rows = 1;
-        uint64_t avail = r->datasz;
-        uint64_t want = (uint64_t)cols * rows;
-        if (avail && avail < want) want = avail;
-        float gx0 = mid - cols * pitch * 0.5f;
-        float gz0 = zn + (nz > 0 ? -2.5f : 2.5f);           /* set back from the door */
-        glBegin(GL_QUADS);
-        for (uint64_t k = 0; k < want; k++){
-            int ci = (int)(k % (uint64_t)cols), ri = (int)(k / (uint64_t)cols);
-            uint64_t off = avail > want ? (uint64_t)((double)k / want * (double)avail) : k;
-            unsigned char v = (r->data && off < avail) ? r->data[off] : 0;
-            float cr, cg, cb; byte_color(v, &cr, &cg, &cb);
-            glColor3f(cr, cg, cb);
-            float cxp = gx0 + (ci + 0.5f) * pitch;
-            float z = gz0 + (nz > 0 ? -1.0f : 1.0f) * ri * pitch;
-            float hh = 0.12f + (v / 255.0f) * 1.10f;
-            float s2 = pitch * 0.36f;
-            quad3(cxp-s2,base,z+s2, cxp+s2,base,z+s2, cxp+s2,base+hh,z+s2, cxp-s2,base+hh,z+s2, 0,0,1);
-            quad3(cxp+s2,base,z-s2, cxp-s2,base,z-s2, cxp-s2,base+hh,z-s2, cxp+s2,base+hh,z-s2, 0,0,-1);
-            quad3(cxp+s2,base,z+s2, cxp+s2,base,z-s2, cxp+s2,base+hh,z-s2, cxp+s2,base+hh,z+s2, 1,0,0);
-            quad3(cxp-s2,base,z-s2, cxp-s2,base,z+s2, cxp-s2,base+hh,z+s2, cxp-s2,base+hh,z-s2, -1,0,0);
-            quad3(cxp-s2,base+hh,z+s2, cxp+s2,base+hh,z+s2, cxp+s2,base+hh,z-s2, cxp-s2,base+hh,z-s2, 0,1,0);
-        }
-        glEnd();
-        break; }
-    case RT_OBJECT: {
-        /* the object's bytes as crates on the floor */
-        uint64_t n16 = (r->size + 15) / 16; if (!n16) n16 = 1;
-        int cols = (int)(w / 0.75f); if (cols < 1) cols = 1;
-        int rows = (int)(depth * 0.7f / 0.75f); if (rows < 1) rows = 1;
-        if ((uint64_t)(cols * rows) < n16) n16 = (uint64_t)cols * rows;
-        glBegin(GL_QUADS);
-        for (uint64_t k = 0; k < n16; k++){
-            int cxi = (int)(k % (uint64_t)cols), czi = (int)(k / (uint64_t)cols);
-            if (czi >= rows) break;
-            float bx0 = x0 + 0.15f + cxi * 0.75f, bz0 = zn + (nz > 0 ? -1.0f - czi*0.75f : 1.0f + czi*0.75f);
-            unsigned nonzero = 0, sum = 0;
-            for (int q = 0; q < 16; q++){
-                uint64_t o = k * 16 + (uint64_t)q;
-                unsigned char v = (r->data && o < r->datasz) ? r->data[o] : 0;
-                if (v) nonzero++;
-                sum += v;
+    case RT_FUNC: case RT_OBJECT: case RT_BYTES: case RT_GROUP:
+        draw_tiles(b, r, a, x0, x1, zn, zf, base);
+        if (r->kind == RT_GROUP && r->units){    /* a plaque over each alcove */
+            glDisable(GL_LIGHTING); glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND);
+            float pitch = b->tile;
+            float cellW = r->cellw * pitch, cellH = r->cellh * pitch;
+            float availW = x1 - x0 - 2 * TILE_MARGIN;
+            float availD = zf - zn - TILE_SETBACK - TILE_MARGIN;
+            float ox = x0 + TILE_MARGIN + (availW - 3 * cellW) * 0.5f;
+            float oz = zn + TILE_SETBACK + (availD - 3 * cellH) * 0.5f;
+            static const int CELL[7][2] = {{0,0},{2,0},{0,1},{2,1},{0,2},{1,2},{2,2}};
+            for (int u = 0; u < r->nunits && u < 7; u++){
+                float cx = ox + (CELL[u][0] + 0.5f) * cellW;
+                float cz = oz + (CELL[u][1] + 0.5f) * cellH;
+                if (fabsf(cx - px) + fabsf(cz - pz) > 26.0f) continue;
+                glColor3f(0.94f, 0.92f, 0.66f);
+                text_billboard(FNT_MONO, cx, base + 1.05f, cz, 0.16f, r->units[u].title);
             }
-            float hh = 0.18f + (nonzero / 16.0f) * 0.55f;
-            float cr, cg, cb; byte_color((unsigned char)(sum / 16), &cr, &cg, &cb);
-            glColor3f(cr * 0.9f, cg * 0.9f, cb * 0.9f);
-            float bx1 = bx0 + 0.62f, bz1 = bz0 + (nz > 0 ? -0.62f : 0.62f);
-            float za = bz0 < bz1 ? bz0 : bz1, zb = bz0 < bz1 ? bz1 : bz0;
-            quad3(bx0,base,zb, bx1,base,zb, bx1,base+hh,zb, bx0,base+hh,zb, 0,0,1);
-            quad3(bx1,base,za, bx0,base,za, bx0,base+hh,za, bx1,base+hh,za, 0,0,-1);
-            quad3(bx1,base,zb, bx1,base,za, bx1,base+hh,za, bx1,base+hh,zb, 1,0,0);
-            quad3(bx0,base,za, bx0,base,zb, bx0,base+hh,zb, bx0,base+hh,za, -1,0,0);
-            quad3(bx0,base+hh,zb, bx1,base+hh,zb, bx1,base+hh,za, bx0,base+hh,za, 0,1,0);
+            glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND); glEnable(GL_LIGHTING);
         }
-        glEnd();
-        break; }
-    case RT_BYTES: {
-        /* raw bytes as a mosaic on the far wall */
-        float bw = clampf(w - 1.0f, 2.0f, 14.0f);
-        int cols = (int)(bw / 0.13f); if (cols > 96) cols = 96; if (cols < 4) cols = 4;
-        int rows = 20;
-        float cw2 = bw / cols, ch = 2.3f / rows;
-        float mx0 = mid - bw * 0.5f;
-        float z = zf + nz * 0.03f;
-        glDisable(GL_LIGHTING);
-        glBegin(GL_QUADS);
-        for (int ry = 0; ry < rows; ry++)
-            for (int cxi = 0; cxi < cols; cxi++){
-                uint64_t idx = (uint64_t)ry * cols + cxi;
-                if (r->datasz && idx >= r->datasz) { ry = rows; break; }
-                unsigned char v = r->data ? r->data[idx] : 0;
-                float cr, cg, cb; byte_color(v, &cr, &cg, &cb);
-                glColor3f(cr, cg, cb);
-                float ax = mx0 + cxi * cw2, ay = base + 3.0f - ry * ch;
-                quad3(ax, ay - ch*0.9f, z, ax + cw2*0.9f, ay - ch*0.9f, z,
-                      ax + cw2*0.9f, ay, z, ax, ay, z, 0, 0, nz);
-            }
-        glEnd();
-        glEnable(GL_LIGHTING);
-        break; }
+        break;
     case RT_LIST: {
         /* the table's entries, printed on a board on the far wall */
         if (!r->nlines) break;
@@ -874,7 +909,8 @@ void render_scene(App *a){
     draw_sky();
 
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    gluPerspective(70.0, h ? (double)w / h : 1.3, 0.14, 1600.0);
+    double farp = (g_city && g_city->farPlane > 100.0f) ? g_city->farPlane : 1600.0;
+    gluPerspective(70.0, h ? (double)w / h : 1.3, 0.25, farp);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
 
     float ex = p->x, ey = p->y + EYE_H, ez = p->z;

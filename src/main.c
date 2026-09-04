@@ -274,16 +274,18 @@ static int selftest(App *a){
         }
         /* walk out of the stairwell along the corridor and into a room */
         int f = a->p.floor;
-        a->p.x = b->bx + 1.0f; a->p.z = b->bz; a->p.y = f * FLOOR_H; a->p.vy = 0;
+        a->p.x = b->bx + CORR_W * 0.5f; a->p.z = b->bz; a->p.y = f * FLOOR_H; a->p.vy = 0;
         int target = -1;
         for (int k = b->floorStart[f]; k < b->floorStart[f+1]; k++)
             if (b->rooms[k].x1 - b->rooms[k].x0 > 3.0f){ target = k; break; }
         if (target < 0) target = b->floorStart[f];
         Room *rm = &b->rooms[target];
-        float doorx = b->bx + (rm->x0 + rm->x1) * 0.5f;
-        step_towards(a, doorx, b->bz, 400);
-        float roomz = rm->side == 0 ? b->bz - CORR_W*0.5f - 2.0f : b->bz + CORR_W*0.5f + 2.0f;
-        step_towards(a, doorx, roomz, 300);
+        float doorx = (room_x0(b, rm) + room_x1(b, rm)) * 0.5f;
+        float corrz = room_z0(b, rm) - CORR_W * 0.5f;
+        step_towards(a, b->bx + CORR_W * 0.5f, corrz, 400);   /* along the spine */
+        step_towards(a, doorx, corrz, 400);                   /* along the row   */
+        float depth = room_z1(b, rm) - room_z0(b, rm);
+        step_towards(a, doorx, room_z0(b, rm) + (depth < 3.0f ? depth * 0.5f : 1.6f), 300);
         int got = room_at(c, &a->p);
         /* entering decodes the room; leaving must free it */
         city_enter_room(c, i, got >= 0 ? got : target);
@@ -341,12 +343,12 @@ static void stand_in_room(App *a, int bi, int ri){
     Building *b = &a->city->bld[bi];
     Room *r = &b->rooms[ri];
     floor_realize(b, r->floor);
-    float mid = b->bx + (r->x0 + r->x1) * 0.5f;
-    float cw = CORR_W * 0.5f;
+    float mid = (room_x0(b, r) + room_x1(b, r)) * 0.5f;
+    float depth = room_z1(b, r) - room_z0(b, r);
     a->p.x = mid;
     a->p.y = r->floor * FLOOR_H;
-    a->p.z = r->side == 0 ? b->bz - cw - 1.0f : b->bz + cw + 1.0f;
-    a->p.yaw = r->side == 0 ? -(float)M_PI * 0.5f : (float)M_PI * 0.5f;
+    a->p.z = room_z0(b, r) + (depth < 2.4f ? depth * 0.5f : 1.2f);
+    a->p.yaw = (float)M_PI * 0.5f;                 /* looking into the room, +Z */
     a->p.pitch = 0.02f;
     a->p.inside = bi; a->p.floor = r->floor; a->p.room = ri;
 }
@@ -389,9 +391,15 @@ static int shot_mode(App *a, const char *dir){
     floor_realize(b, 0);
     shot(a, dir, "04-stairwell");
 
-    a->p.x = b->bx + 2.0f; a->p.z = b->bz; a->p.y = 0;
-    a->p.yaw = 0.02f; a->p.pitch = 0.02f;
-    a->p.inside = bi; a->p.floor = 0;
+    /* stand in the first row's corridor and look along it */
+    {
+        Room *r0 = &b->rooms[b->floorStart[0]];
+        a->p.x = b->bx + CORR_W * 0.5f + 1.0f;
+        a->p.z = room_z0(b, r0) - CORR_W * 0.5f;
+        a->p.y = 0;
+        a->p.yaw = 0.02f; a->p.pitch = 0.02f;
+        a->p.inside = bi; a->p.floor = 0;
+    }
     shot(a, dir, "05-corridor");
 
     int ri = -1;
@@ -438,8 +446,8 @@ static int shot_mode(App *a, const char *dir){
 
     {   /* and again from among the sculptures */
         Room *rr = &cb->rooms[cri];
-        float cwh = CORR_W * 0.5f;
-        a->p.z = rr->side == 0 ? cb->bz - cwh - 3.0f : cb->bz + cwh + 3.0f;
+        float rd = room_z1(cb, rr) - room_z0(cb, rr);
+        a->p.z = room_z0(cb, rr) + (rd < 4.0f ? rd * 0.5f : 2.6f);
         a->p.pitch = -0.16f;
         shot(a, dir, "12-code-close");
     }
@@ -459,11 +467,12 @@ int main(int argc, char **argv){
     a->lastB = a->lastR = -2; a->nearIns = -1;
 
     const char *start = NULL, *shotdir = NULL;
-    int dotest = 0, dobench = 0;
+    int dotest = 0, dobench = 0, dostats = 0;
     for (int i = 1; i < argc; i++){
         if (!strcmp(argv[i], "--shot") && i + 1 < argc){ shotdir = argv[++i]; continue; }
         if (!strcmp(argv[i], "--selftest")){ dotest = 1; continue; }
         if (!strcmp(argv[i], "--bench")){ dobench = 1; continue; }
+        if (!strcmp(argv[i], "--stats")){ dostats = 1; continue; }
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")){
             printf("usage: %s [options] [binary-or-library]\n"
                    "\n"
@@ -472,6 +481,7 @@ int main(int argc, char **argv){
                    "\n"
                    "  --shot DIR    render a set of canned viewpoints into DIR as .ppm and exit\n"
                    "  --selftest    headless check that every tower can be entered and climbed\n"
+                   "  --stats       print the layout the packer produced, and exit\n"
                    "  -h, --help    this text\n", argv[0]);
             return 0;
         }
@@ -482,6 +492,52 @@ int main(int argc, char **argv){
         for (int i = 0; cand[i] && !start; i++) if (!access(cand[i], R_OK)) start = cand[i];
     }
     if (!start){ fprintf(stderr, "give me an ELF file to explore\n"); return 1; }
+
+    if (dostats){
+        char err[256];
+        Elf *e = elf_open(start, err, sizeof err);
+        if (!e){ fprintf(stderr, "%s: %s\n", start, err); return 1; }
+        disasm_open(e->machine, e->is64, e->be);
+        City *c = city_build(e);
+        long rooms = 0, chambers = 0, units = 0, recovered = 0;
+        int maxfl = 0; float maxh = 0;
+        printf("%-20s %7s %7s %6s %6s %14s %9s\n",
+               "section","rooms","tiles","floors","height","plate (m)","tile(m)");
+        for (int i = 0; i < c->nbld; i++){
+            Building *b = &c->bld[i];
+            long ch = 0, un = 0, tl = 0;
+            for (int k = 0; k < b->nrooms; k++){
+                tl += b->rooms[k].ntiles;
+                if (b->rooms[k].kind == RT_GROUP){ ch++; un += b->rooms[k].nunits; }
+                if (!strncmp(b->rooms[k].title, "sub_", 4)) recovered++;
+            }
+            rooms += b->nrooms; chambers += ch; units += un;
+            if (b->nfloors > maxfl) maxfl = b->nfloors;
+            if (b->h > maxh) maxh = b->h;
+            if (b->nrooms >= 8)
+                printf("%-20s %7d %7ld %6d %5.0fm %6.1f x %-5.1f %9.3f\n",
+                       b->label, b->nrooms, tl, b->nfloors, b->h, b->plateW, b->plateD, b->tile);
+        }
+        printf("\n%s: %d buildings, %ld rooms (%ld chambers holding %ld units, %ld recovered)\n",
+               e->base, c->nbld, rooms, chambers, units, recovered);
+        printf("tallest %.0f m / %d floors   city %.0f x %.0f m   far plane %.0f m\n",
+               maxh, maxfl, c->maxx - c->minx, c->maxz - c->minz, c->farPlane);
+        {   int hist[12] = {0}, tot = 0, bad = 0;
+            for (int i = 0; i < c->nbld; i++){
+                Building *b = &c->bld[i];
+                for (int f = 0; f < b->nfloors; f++){
+                    int k = b->floorStart[f+1] - b->floorStart[f];
+                    if (k < 1 || k > MAXPF) bad++;
+                    hist[k < 11 ? k : 11]++; tot++;
+                }
+            }
+            printf("rooms per floor:");
+            for (int k = 1; k <= 10; k++) if (hist[k]) printf("  %d:%d", k, hist[k]);
+            printf("   (%d floors, %d outside 1..%d)\n", tot, bad, MAXPF);
+        }
+        city_free(c); disasm_close(); elf_close(e);
+        return 0;
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0){
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1;
@@ -525,7 +581,10 @@ int main(int argc, char **argv){
         for (int k = bb->floorStart[0]; k < bb->floorStart[1]; k++)
             if (bb->rooms[k].size > best){ best = bb->rooms[k].size; ri = k; }
         stand_in_room(a, bi, ri);
-        a->p.z += (bb->rooms[ri].side == 0 ? -2.0f : 2.0f);
+        {   Room *q = &bb->rooms[ri];
+            float qd = room_z1(bb, q) - room_z0(bb, q);
+            if (qd > 5.0f) a->p.z += 2.0f;
+        }
         room_lifecycle(a);
         Room *rr = &bb->rooms[ri];
         Uint64 t0 = SDL_GetPerformanceCounter();

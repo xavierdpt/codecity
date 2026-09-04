@@ -248,8 +248,8 @@ void hud_draw(App *a){
         snprintf(ln[n++], 160, "vaddr      0x%llx", (unsigned long long)r->addr);
         snprintf(ln[n++], 160, "file off   0x%llx", (unsigned long long)r->fileoff);
         snprintf(ln[n++], 160, "size       %llu bytes", (unsigned long long)r->size);
-        snprintf(ln[n++], 160, "floor      %d of %d,  %s side",
-                 r->floor + 1, b->nfloors, r->side ? "south" : "north");
+        snprintf(ln[n++], 160, "floor      %d of %d,  row %d",
+                 r->floor + 1, b->nfloors, r->row + 1);
         snprintf(ln[n++], 160, "doors      corridor%s%s", r->linkPrev >= 0 ? ", west neighbour" : "",
                  r->linkNext >= 0 ? ", east neighbour" : "");
         glColor4f(0.82f, 0.86f, 0.90f, 1);

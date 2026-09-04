@@ -5,7 +5,7 @@ CFLAGS  ?= -O2 -g
 CFLAGS  += -Wall -Wextra -std=c11 -Isrc $(shell pkg-config --cflags $(PKGS))
 LDLIBS   = $(shell pkg-config --libs $(PKGS)) -lm
 
-SRC = src/elfload.c src/disasm.c src/city.c src/world.c src/text.c src/render.c src/hud.c src/main.c
+SRC = src/elfload.c src/ehframe.c src/disasm.c src/city.c src/world.c src/text.c src/render.c src/hud.c src/main.c
 OBJ = $(SRC:.c=.o)
 BIN = elfcity
 

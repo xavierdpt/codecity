@@ -45,7 +45,13 @@ void emit_shell(const Building *b, BoxSink f, void *ud){
     box(f, ud, x1 - 0.35f, h + 0.25f, z0, x1, h + 1.3f, z1, M_ROOF);
 }
 
-/* walls, partitions and the slab of one floor */
+/* walls, partitions and the slab of one floor.
+ *
+ * The plan is a comb: a spine corridor runs along +Z at the stair end, and
+ * every row hangs off it -- a corridor strip, then that row's rooms, whose
+ * doors are all in their z0 wall.  Rooms shallower than their row get a
+ * solid filler behind them so the shell stays a box.
+ */
 void emit_floor(const Building *b, int fl, BoxSink f, void *ud){
     if (fl < 0 || fl >= b->nfloors) return;
     float base = fl * FLOOR_H, top = base + FLOOR_H;
@@ -53,57 +59,59 @@ void emit_floor(const Building *b, int fl, BoxSink f, void *ud){
     float cw = CORR_W * 0.5f;
     float T = WALL_T;
 
-    /* slab under the corridor + rooms */
+    /* slab under the whole plate, plus the landing in front of the stair */
     box(f, ud, b->bx, base - 0.18f, z0, x1, base, z1, M_SLAB);
-    /* landing in front of the stair, on every floor */
     box(f, ud, b->bx - 2.4f, base - 0.18f, b->bz - cw, b->bx, base, b->bz + cw, M_SLAB);
-    if (fl == 0) box(f, ud, x0, -0.18f, z0, b->bx, 0, z1, M_SLAB);   /* core ground */
+    if (fl == 0) box(f, ud, x0, -0.18f, z0, b->bx, 0, z1, M_SLAB);
 
-    /* core / corridor divider */
+    /* core wall, with the doorway onto the spine */
     box(f, ud, b->bx - T, base, z0, b->bx, top, b->bz - cw, M_CORE);
     box(f, ud, b->bx - T, base, b->bz + cw, b->bx, top, z1, M_CORE);
 
-    /* central column of the spiral stair */
     float sx, sz; stair_center(b, &sx, &sz);
     box(f, ud, sx - STAIR_RIN, base, sz - STAIR_RIN, sx + STAIR_RIN,
         b->nfloors * FLOOR_H, sz + STAIR_RIN, M_COLUMN);
 
     int a = b->floorStart[fl], e = b->floorStart[fl + 1];
-    float endx[2] = { 0, 0 };
+
+    /* how deep each row ended up, so shallow rooms can be backfilled */
+    float rowEnd[64];
+    for (int k = 0; k < 64; k++) rowEnd[k] = 0;
     for (int i = a; i < e; i++){
         const Room *r = &b->rooms[i];
-        if (r->x1 > endx[r->side]) endx[r->side] = r->x1;
-        float rx0 = b->bx + r->x0, rx1 = b->bx + r->x1;
-        float wz0, wz1, bz0, bz1;
-        if (r->side == 0){ wz0 = b->bz - cw - T; wz1 = b->bz - cw; bz0 = z0 + T; bz1 = wz0; }
-        else             { wz0 = b->bz + cw;     wz1 = b->bz + cw + T; bz0 = wz1; bz1 = z1 - T; }
+        if (r->row < 0 || r->row >= 64) continue;
+        if (r->z1 > rowEnd[r->row]) rowEnd[r->row] = r->z1;
+    }
 
-        /* corridor wall with a doorway */
+    for (int i = a; i < e; i++){
+        const Room *r = &b->rooms[i];
+        float rx0 = room_x0(b, r), rx1 = room_x1(b, r);
+        float rz0 = room_z0(b, r), rz1 = room_z1(b, r);
+
+        /* front wall, on the corridor, with a doorway in the middle */
         float dw = clampf(rx1 - rx0 - 1.0f, 0.8f, DOOR_W);
         float mid = (rx0 + rx1) * 0.5f, dl = mid - dw * 0.5f, dr = mid + dw * 0.5f;
-        box(f, ud, rx0, base, wz0, dl, top, wz1, M_WALL);
-        box(f, ud, dr, base, wz0, rx1, top, wz1, M_WALL);
-        box(f, ud, dl, base + DOOR_H, wz0, dr, top, wz1, M_LINTEL);
+        box(f, ud, rx0 - T, base, rz0 - T, dl, top, rz0, M_WALL);
+        box(f, ud, dr, base, rz0 - T, rx1 + T, top, rz0, M_WALL);
+        box(f, ud, dl, base + DOOR_H, rz0 - T, dr, top, rz0, M_LINTEL);
 
-        /* partition at the far end of the room (shared with the next room) */
-        if (r->x1 < b->len - 0.05f){
-            int door = (r->linkNext >= 0);
-            float pz = (bz0 + bz1) * 0.5f;
-            if (door){
-                box(f, ud, rx1, base, bz0, rx1 + T, top, pz - DOOR_W * 0.5f, M_PART);
-                box(f, ud, rx1, base, pz + DOOR_W * 0.5f, rx1 + T, top, bz1, M_PART);
-                box(f, ud, rx1, base + DOOR_H, pz - DOOR_W * 0.5f, rx1 + T, top, pz + DOOR_W * 0.5f, M_LINTEL);
-            } else {
-                box(f, ud, rx1, base, bz0, rx1 + T, top, bz1, M_PART);
-            }
+        /* side walls -- doubling up across a slack gap reads as a pier */
+        int door = (r->linkNext >= 0);
+        box(f, ud, rx0 - T, base, rz0, rx0, top, rz1, M_PART);
+        if (door){
+            float pz = (rz0 + rz1) * 0.5f;
+            box(f, ud, rx1, base, rz0, rx1 + T, top, pz - DOOR_W * 0.5f, M_PART);
+            box(f, ud, rx1, base, pz + DOOR_W * 0.5f, rx1 + T, top, rz1, M_PART);
+            box(f, ud, rx1, base + DOOR_H, pz - DOOR_W * 0.5f, rx1 + T, top, pz + DOOR_W * 0.5f, M_LINTEL);
+        } else {
+            box(f, ud, rx1, base, rz0, rx1 + T, top, rz1, M_PART);
         }
-    }
-    /* blank wall along the stretch of corridor with no rooms behind it */
-    for (int side = 0; side < 2; side++){
-        if (endx[side] >= b->len - 0.2f) continue;
-        float wz0 = side ? b->bz + cw : b->bz - cw - T;
-        float wz1 = side ? b->bz + cw + T : b->bz - cw;
-        box(f, ud, b->bx + endx[side], base, wz0, x1, top, wz1, M_PART);
+
+        /* back wall, then the filler out to the depth of the row */
+        box(f, ud, rx0 - T, base, rz1, rx1 + T, top, rz1 + T, M_PART);
+        float end = (r->row >= 0 && r->row < 64) ? bld_z0(b) + rowEnd[r->row] : rz1;
+        if (end > rz1 + T + 0.02f)
+            box(f, ud, rx0 - T, base, rz1 + T, rx1 + T, top, end, M_PART);
     }
 }
 
@@ -271,15 +279,11 @@ int room_at(City *c, const Player *p){
     if (p->inside < 0) return -1;
     Building *b = &c->bld[p->inside];
     if (p->floor < 0 || p->floor >= b->nfloors) return -1;
-    float lx = p->x - b->bx, lz = p->z - b->bz;
-    if (lx < 0) return -1;
-    int side;
-    if (lz < -CORR_W * 0.5f) side = 0;
-    else if (lz > CORR_W * 0.5f) side = 1;
-    else return -1;
     for (int i = b->floorStart[p->floor]; i < b->floorStart[p->floor + 1]; i++){
         Room *r = &b->rooms[i];
-        if (r->side == side && lx >= r->x0 - 0.2f && lx <= r->x1 + 0.2f) return i;
+        if (p->x >= room_x0(b, r) - 0.15f && p->x <= room_x1(b, r) + 0.15f &&
+            p->z >= room_z0(b, r) - 0.15f && p->z <= room_z1(b, r) + 0.15f)
+            return i;
     }
     return -1;
 }

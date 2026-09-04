@@ -9,6 +9,7 @@
  */
 #define _GNU_SOURCE
 #include "model.h"
+#include "ehframe.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -25,12 +26,15 @@
 #define SHT_REL 9
 #define SHT_DYNSYM 11
 
-#define MAX_ROOMS_PER_BLD 1400
-#define MAX_FLOORS         34
+/* No cap on rooms or floors: a floor costs almost nothing until you stand
+   on it, so a 3 MB .text is allowed to be a 300-storey tower.  The bound
+   below only stops a corrupt file from exhausting memory.               */
+#define MAX_ROOMS_PER_BLD  200000
 #define LINES_PER_ROOM     22
+#define MAX_ROWS           24      /* comb rows per floor                */
+#define PLATE_MAX_SIDE     18.0f   /* the biggest room's grid, in metres */
 
 static float clampf(float v, float a, float b){ return v < a ? a : (v > b ? b : v); }
-static float log2f_safe(double v){ return (float)(log(v + 1.0) / log(2.0)); }
 
 /* ------------------------------------------------------------------ */
 /* room construction                                                   */
@@ -153,6 +157,73 @@ static void rooms_from_strings(RoomVec *v, Sec *s){
             start = i; count = 0;
         }
     }
+}
+
+/* rooms from recovered function boundaries: .eh_frame first, then a byte
+   scan for whatever it does not reach.  This is what makes a stripped
+   binary legible -- without it the whole of .text is arbitrary slabs.  */
+static int cmp_u(const void *a, const void *b){
+    const Unitrange *x = a, *y = b;
+    if (x->addr != y->addr) return x->addr < y->addr ? -1 : 1;
+    return 0;
+}
+
+static int rooms_from_units(RoomVec *v, Elf *e, Sec *s,
+                            const Unitrange *all, int nall){
+    uint64_t lo = s->addr, hi = s->addr + s->size;
+    if (!s->size) return 0;
+
+    Unitrange *u = NULL; int n = 0, cap = 0;
+    for (int i = 0; i < nall; i++){
+        if (all[i].addr < lo || all[i].addr >= hi) continue;
+        if (n == cap){ cap = cap ? cap * 2 : 256; u = realloc(u, (size_t)cap * sizeof *u); }
+        u[n++] = all[i];
+    }
+    /* spans the unwind tables never described: scan them for entries */
+    uint64_t cur = lo;
+    int nfde = n;
+    for (int i = 0; i < nfde; i++){
+        if (u[i].addr > cur + 256) n = seed_units(e, s, cur, u[i].addr, &u, n);
+        uint64_t end = u[i].addr + u[i].size;
+        if (end > cur) cur = end;
+    }
+    if (hi > cur + 256) n = seed_units(e, s, cur, hi, &u, n);
+    if (n < 1){ free(u); return 0; }
+
+    qsort(u, (size_t)n, sizeof *u, cmp_u);
+    int m = 0;                                     /* unique, ascending */
+    for (int i = 0; i < n; i++)
+        if (!m || u[i].addr > u[m-1].addr) u[m++] = u[i];
+    n = m;
+
+    char sz[32];
+    for (int i = 0; i < n && v->n < MAX_ROOMS_PER_BLD; i++){
+        uint64_t a = u[i].addr;
+        uint64_t end = (i + 1 < n) ? u[i+1].addr : hi;
+        if (u[i].size && a + u[i].size < end) end = a + u[i].size;
+        if (end <= a) continue;
+        uint64_t len = end - a, rel = a - s->addr;
+        Room *r = rv_add(v);
+        r->kind = (s->type == SHT_NOBITS) ? RT_EMPTY : RT_FUNC;
+        r->addr = a; r->size = len; r->fileoff = s->offset + rel;
+        if (s->data && rel < s->datasz){
+            r->data = s->data + rel;
+            r->datasz = s->datasz - rel; if (r->datasz > len) r->datasz = len;
+        }
+        human(sz, sizeof sz, len);
+        uint64_t soff = 0;
+        const char *nm = elf_sym_at(e, a, &soff);
+        if (nm && nm[0] && soff == 0){
+            snprintf(r->title, sizeof r->title, "%s", nm);
+            snprintf(r->sub, sizeof r->sub, "%s  0x%llx", sz, (unsigned long long)a);
+        } else {
+            snprintf(r->title, sizeof r->title, "sub_%llx", (unsigned long long)a);
+            snprintf(r->sub, sizeof r->sub, "%s  recovered %s", sz,
+                     i < nfde ? "from .eh_frame" : "by call scan");
+        }
+    }
+    free(u);
+    return 1;
 }
 
 /* rooms holding a slab of raw bytes */
@@ -385,7 +456,226 @@ static const float DISTRICT_COL[DK_COUNT][3] = {
     { 0.70f, 0.70f, 0.50f },   /* MISC                    */
 };
 
-static void build_one(Building *b, Elf *e, Sec *s){
+/* ------------------------------------------------------------------ */
+/* content grid                                                        */
+/* ------------------------------------------------------------------ */
+
+/* the most-filled near-square rectangle holding at least n tiles.
+   15 -> 3x5 exactly; 17 -> 4x5, because 1x17 is not a room.            */
+static void tile_rect(int n, int *w, int *h){
+    if (n < 1) n = 1;
+    int a = (int)sqrt((double)n);
+    if (a < 2) a = 2;
+    int b = (n + a - 1) / a;
+    if (b < a){ int t = a; a = b; b = t; }
+    *w = b; *h = a;                       /* long side along the row */
+}
+
+/* how many tiles of content a room holds: one per instruction, per
+   16-byte line, or per printed row, depending on what it is.           */
+static int room_tiles(const Elf *e, const Room *r){
+    uint64_t n;
+    switch (r->kind){
+    case RT_FUNC: {
+        int avg = 4;                               /* x86-64 mean length */
+        if (e->machine == 40) avg = 4;             /* ARM   */
+        if (e->machine == 183) avg = 4;            /* AArch64 */
+        n = (r->size + (uint64_t)avg - 1) / (uint64_t)avg;
+        break; }
+    case RT_LIST:   n = r->hi > r->lo ? r->hi - r->lo : 1; break;
+    case RT_EMPTY:  n = 1; break;
+    default:        n = (r->size + 15) / 16; break;
+    }
+    if (n < 1) n = 1;
+    if (n > 40000) n = 40000;
+    return (int)n;
+}
+
+/* ------------------------------------------------------------------ */
+/* chambers: small units share a 3x3 room with the middle left open    */
+/* ------------------------------------------------------------------ */
+
+/* the seven cells a visitor can reach: the middle is circulation and
+   (1,0) is the doorway.                                               */
+#define GROUP_PER 7   /* 3x3 cells, less the middle and the doorway */
+
+static int groupable(const Room *r){
+    return (r->kind == RT_FUNC || r->kind == RT_OBJECT ||
+            r->kind == RT_BYTES || r->kind == RT_EMPTY) &&
+           r->ntiles <= GROUP_TILES;
+}
+
+static int cmp_tiles_desc(const void *a, const void *b){
+    const Room *x = a, *y = b;
+    if (x->ntiles != y->ntiles) return x->ntiles < y->ntiles ? 1 : -1;
+    if (x->addr != y->addr) return x->addr < y->addr ? -1 : 1;
+    return 0;
+}
+
+/* Replaces runs of small rooms with chambers.  Returns the new count. */
+static int group_small(Room **rp, int n){
+    Room *r = *rp;
+    int nsmall = 0;
+    for (int i = 0; i < n; i++) if (groupable(&r[i])) nsmall++;
+    if (nsmall < GROUP_PER * 2) return n;           /* not worth it */
+
+    Room *big = malloc((size_t)(n - nsmall + 1) * sizeof(Room));
+    Room *sml = malloc((size_t)nsmall * sizeof(Room));
+    int nb = 0, ns = 0;
+    for (int i = 0; i < n; i++){
+        if (groupable(&r[i])) sml[ns++] = r[i]; else big[nb++] = r[i];
+    }
+    /* group units of similar size together, so cells waste little */
+    qsort(sml, (size_t)ns, sizeof(Room), cmp_tiles_desc);
+
+    int nchamber = (ns + GROUP_PER - 1) / GROUP_PER;
+    Room *out = malloc((size_t)(nb + nchamber) * sizeof(Room));
+    memcpy(out, big, (size_t)nb * sizeof(Room));
+    int m = nb;
+
+    for (int i = 0; i < ns; i += GROUP_PER){
+        int k = ns - i < GROUP_PER ? ns - i : GROUP_PER;
+        Room *c = &out[m++];
+        memset(c, 0, sizeof *c);
+        c->kind = RT_GROUP; c->symidx = -1; c->linkPrev = c->linkNext = -1;
+        c->units = malloc((size_t)k * sizeof(Unit));
+        c->nunits = k;
+        int maxt = 1; uint64_t lo = UINT64_MAX, tot = 0;
+        for (int j = 0; j < k; j++){
+            Room *u = &sml[i + j];
+            Unit *un = &c->units[j];
+            memset(un, 0, sizeof *un);
+            un->addr = u->addr; un->size = u->size; un->fileoff = u->fileoff;
+            un->data = u->data; un->datasz = u->datasz; un->symidx = u->symidx;
+            un->cell = j; un->ntiles = u->ntiles;
+            tile_rect(u->ntiles, &un->tw, &un->th);
+            snprintf(un->title, sizeof un->title, "%s", u->title);
+            if (u->ntiles > maxt) maxt = u->ntiles;
+            if (u->addr && u->addr < lo) lo = u->addr;
+            tot += u->size;
+            if (!c->data){ c->data = u->data; c->datasz = u->datasz; }
+        }
+        tile_rect(maxt, &c->cellw, &c->cellh);
+        c->tw = c->cellw * 3; c->th = c->cellh * 3;
+        c->ntiles = c->tw * c->th;
+        c->addr = lo == UINT64_MAX ? 0 : lo;
+        c->size = tot;
+        c->fileoff = sml[i].fileoff;
+        snprintf(c->title, sizeof c->title, "%d small units", k);
+        if (c->addr) snprintf(c->sub, sizeof c->sub, "%d units  %llu bytes  from 0x%llx",
+                              k, (unsigned long long)tot, (unsigned long long)c->addr);
+        else         snprintf(c->sub, sizeof c->sub, "%d units  %llu bytes",
+                              k, (unsigned long long)tot);
+    }
+    free(big); free(sml); free(r);
+    *rp = out;
+    return m;
+}
+
+/* ------------------------------------------------------------------ */
+/* floor plate + shelf packing                                         */
+/* ------------------------------------------------------------------ */
+
+static void room_metres(const Building *b, const Room *r, float *w, float *d){
+    float t = b->tile;
+    float ww = r->tw * t + 2 * TILE_MARGIN + 2 * WALL_T;
+    float dd = r->th * t + TILE_MARGIN + TILE_SETBACK;
+    *w = ww < ROOM_W_MIN ? ROOM_W_MIN : ww;
+    *d = dd < ROOM_D_MIN ? ROOM_D_MIN : dd;
+}
+
+typedef struct { float used[MAX_ROWS], depth[MAX_ROWS]; int cnt[MAX_ROWS]; int nrow, count; } Fl;
+
+static int cmp_area_desc(const void *a, const void *b){
+    const Room *const *x = a, *const *y = b;
+    long ax = (long)(*x)->tw * (*x)->th, ay = (long)(*y)->tw * (*y)->th;
+    if (ax != ay) return ax < ay ? 1 : -1;
+    if ((*x)->addr != (*y)->addr) return (*x)->addr < (*y)->addr ? -1 : 1;
+    return 0;
+}
+
+/* Places every room on a floor and a row.  Returns the floor count. */
+static int shelf_pack(Building *b, Room **ord, int n, float W, float D){
+    float usable = W - CORR_W;                    /* the spine eats the rest */
+    Fl *fl = NULL; int nfl = 0, cap = 0;
+    for (int i = 0; i < n; i++){
+        Room *r = ord[i];
+        float w, d; room_metres(b, r, &w, &d);
+        int done = 0;
+        for (int f = 0; f < nfl && !done; f++){
+            Fl *F = &fl[f];
+            if (F->count >= MAXPF) continue;
+            float usedD = 0;
+            for (int k = 0; k < F->nrow; k++) usedD += F->depth[k] + CORR_W;
+            for (int k = 0; k < F->nrow; k++){
+                if (F->used[k] + w + WALL_T > usable) continue;
+                if (d <= F->depth[k]){
+                    F->used[k] += w + WALL_T; F->cnt[k]++; F->count++;
+                    r->floor = f; r->row = k; done = 1; break;
+                }
+                if (usedD - F->depth[k] + d + CORR_W <= D){      /* deepen it */
+                    F->depth[k] = d;
+                    F->used[k] += w + WALL_T; F->cnt[k]++; F->count++;
+                    r->floor = f; r->row = k; done = 1; break;
+                }
+            }
+            if (done) break;
+            if (F->nrow < MAX_ROWS && usedD + d + CORR_W <= D){
+                int k = F->nrow++;
+                F->used[k] = w + WALL_T; F->depth[k] = d; F->cnt[k] = 1;
+                F->count++; r->floor = f; r->row = k; done = 1;
+            }
+        }
+        if (!done){
+            if (nfl == cap){ cap = cap ? cap * 2 : 64;
+                             fl = realloc(fl, (size_t)cap * sizeof *fl); }
+            Fl *F = &fl[nfl];
+            memset(F, 0, sizeof *F);
+            F->nrow = 1; F->used[0] = w + WALL_T; F->depth[0] = d; F->cnt[0] = 1;
+            F->count = 1;
+            r->floor = nfl; r->row = 0;
+            nfl++;
+        }
+    }
+    /* second pass: give every room its rect now that row depths are final */
+    for (int f = 0; f < nfl; f++){
+        Fl *F = &fl[f];
+        float z = 0, cur[MAX_ROWS], rz[MAX_ROWS];
+        for (int k = 0; k < F->nrow; k++){
+            z += CORR_W;                        /* this row's corridor */
+            rz[k] = z;
+            z += F->depth[k];
+            cur[k] = CORR_W;                    /* rooms start past the spine */
+        }
+        /* spread the row's leftover into the gaps between its rooms */
+        float slack[MAX_ROWS];
+        for (int k = 0; k < F->nrow; k++)
+            slack[k] = F->cnt[k] ? (usable - F->used[k]) / (float)(F->cnt[k] + 1) : 0;
+        for (int i = 0; i < n; i++){
+            Room *r = ord[i];
+            if (r->floor != f) continue;
+            int k = r->row;
+            float w, d; room_metres(b, r, &w, &d);
+            cur[k] += slack[k];
+            r->x0 = cur[k]; r->x1 = cur[k] + w;
+            cur[k] += w + WALL_T;
+            r->z0 = rz[k]; r->z1 = rz[k] + d;
+        }
+    }
+    free(fl);
+    return nfl;
+}
+
+static int cmp_place(const void *a, const void *b){
+    const Room *x = a, *y = b;
+    if (x->floor != y->floor) return x->floor < y->floor ? -1 : 1;
+    if (x->row   != y->row)   return x->row   < y->row   ? -1 : 1;
+    if (x->x0    != y->x0)    return x->x0    < y->x0    ? -1 : 1;
+    return 0;
+}
+
+static void build_one(Building *b, Elf *e, Sec *s,
+                      const Unitrange *units, int nunits){
     memset(b, 0, sizeof *b);
     b->elf = e; b->sec = s; b->district = s->district; b->realized = -1;
     snprintf(b->label, sizeof b->label, "%s", s->name);
@@ -395,7 +685,12 @@ static void build_one(Building *b, Elf *e, Sec *s){
     }
 
     RoomVec v = {0};
-    if (s->symCount > 0)                    rooms_from_syms(&v, e, s);
+    int isexec = (s->flags & 0x4) != 0;
+    /* Recovered boundaries beat symbols for code: a stripped file still has
+       a .dynsym full of imports, which covers almost none of .text.       */
+    if (isexec && nunits > 0 && rooms_from_units(&v, e, s, units, nunits))
+        ;
+    else if (s->symCount > 0)               rooms_from_syms(&v, e, s);
     else if (s->type == SHT_STRTAB)         rooms_from_strings(&v, s);
     else if (s->type == SHT_SYMTAB || s->type == SHT_DYNSYM)
         rooms_from_entries(&v, s, LS_SYMS, s->entsize ? s->entsize : (e->is64 ? 24u : 16u), "symbols");
@@ -425,71 +720,82 @@ static void build_one(Building *b, Elf *e, Sec *s){
     b->rooms = v.r; b->nrooms = v.n;
     b->truncated = (v.n >= MAX_ROOMS_PER_BLD);
 
-    /* --- stack the rooms into floors ----------------------------- */
-    int per = 8;
-    if (b->nrooms > per * MAX_FLOORS){
-        per = (b->nrooms + MAX_FLOORS - 1) / MAX_FLOORS;
-        if (per & 1) per++;
-        if (per > 44) per = 44;
+    /* --- how much content each room holds ------------------------- */
+    for (int i = 0; i < b->nrooms; i++){
+        Room *r = &b->rooms[i];
+        r->ntiles = room_tiles(e, r);
+        tile_rect(r->ntiles, &r->tw, &r->th);
     }
-    b->nfloors = (b->nrooms + per - 1) / per;
+
+    /* --- small units share a chamber ------------------------------ */
+    b->nrooms = group_small(&b->rooms, b->nrooms);
+
+    /* --- metres per tile, so the biggest room stays walkable ------ */
+    int maxside = 1;
+    for (int i = 0; i < b->nrooms; i++)
+        if (b->rooms[i].tw > maxside) maxside = b->rooms[i].tw;
+    b->tile = TILE_M;
+    if (maxside * TILE_M > PLATE_MAX_SIDE) b->tile = PLATE_MAX_SIDE / (float)maxside;
+    if (b->tile < TILE_MIN) b->tile = TILE_MIN;
+
+    /* --- the floor plate: big enough for the largest room, and for a
+           full quota of typical ones ------------------------------- */
+    float wmax = 0, dmax = 0, asum = 0;
+    for (int i = 0; i < b->nrooms; i++){
+        float w, d; room_metres(b, &b->rooms[i], &w, &d);
+        if (w > wmax) wmax = w;
+        if (d > dmax) dmax = d;
+        asum += w * d;
+    }
+    float mean = b->nrooms ? asum / (float)b->nrooms : 1.0f;
+    /* room for a full floor -- but never for more rooms than exist, or a
+       three-room section gets the footprint of a ten-room one            */
+    int quota = b->nrooms < MAXPF ? b->nrooms : MAXPF;
+    float A = wmax * dmax;
+    if (quota * mean > A) A = quota * mean;
+    A /= PLATE_FILL;
+    float side = sqrtf(A);
+    b->plateW = wmax + CORR_W + 2 * WALL_T;  if (side > b->plateW) b->plateW = side;
+    b->plateD = dmax + CORR_W + 2 * WALL_T;
+    if (A / b->plateW > b->plateD) b->plateD = A / b->plateW;
+    b->len = b->plateW;
+
+    /* --- pack, biggest first -------------------------------------- */
+    Room **ord = malloc((size_t)(b->nrooms ? b->nrooms : 1) * sizeof(Room *));
+    for (int i = 0; i < b->nrooms; i++) ord[i] = &b->rooms[i];
+    qsort(ord, (size_t)b->nrooms, sizeof(Room *), cmp_area_desc);
+    b->nfloors = shelf_pack(b, ord, b->nrooms, b->plateW, b->plateD);
+    free(ord);
     if (b->nfloors < 1) b->nfloors = 1;
-    if (b->nfloors > MAX_FLOORS) b->nfloors = MAX_FLOORS;
+
+    /* --- reorder so a floor's rooms are contiguous ----------------- */
+    qsort(b->rooms, (size_t)b->nrooms, sizeof(Room), cmp_place);
     b->floorStart = malloc((size_t)(b->nfloors + 1) * sizeof(int));
-    for (int f = 0; f <= b->nfloors; f++){
-        int i = f * per; if (i > b->nrooms) i = b->nrooms;
-        b->floorStart[f] = i;
-    }
-    b->floorStart[b->nfloors] = b->nrooms;
-
-    /* --- natural widths, then a corridor length that fits ---------- */
-    float natural = 0;
-    for (int f = 0; f < b->nfloors; f++){
-        float side[2] = {0, 0};
-        int a = b->floorStart[f], z = b->floorStart[f + 1];
-        for (int i = a; i < z; i++){
-            Room *r = &b->rooms[i];
-            r->floor = f; r->side = (i - a) & 1;
-            side[r->side] += clampf(2.8f + 1.15f * log2f_safe((double)r->size), 2.8f, 15.0f);
-        }
-        if (side[0] > natural) natural = side[0];
-        if (side[1] > natural) natural = side[1];
-    }
-    b->len = clampf(natural, 16.0f, 90.0f);
-
-    /* --- lay each floor out along the corridor -------------------- */
-    for (int f = 0; f < b->nfloors; f++){
-        int a = b->floorStart[f], z = b->floorStart[f + 1];
-        float sum[2] = {0, 0};
-        for (int i = a; i < z; i++){
-            Room *r = &b->rooms[i];
-            sum[r->side] += clampf(2.8f + 1.15f * log2f_safe((double)r->size), 2.8f, 15.0f);
-        }
-        float cur[2] = {0, 0};
-        int last[2] = {-1, -1};
-        for (int i = a; i < z; i++){
-            Room *r = &b->rooms[i];
-            float w = clampf(2.8f + 1.15f * log2f_safe((double)r->size), 2.8f, 15.0f);
-            float scale = sum[r->side] > 0.01f ? b->len / sum[r->side] : 1.0f;
-            if (scale > 2.6f) scale = 2.6f;
-            r->x0 = cur[r->side];
-            cur[r->side] += w * scale;
-            r->x1 = cur[r->side];
-            /* a door through the party wall when the two rooms are
-               contiguous in the file -- code that runs on into code   */
-            int p = last[r->side];
-            if (p >= 0){
-                Room *q = &b->rooms[p];
-                if (q->addr && r->addr && q->addr + q->size + 16 >= r->addr){
-                    q->linkNext = i; r->linkPrev = p;
-                }
-            }
-            last[r->side] = i;
-        }
+    {
+        int f = 0;
+        b->floorStart[0] = 0;
+        for (int i = 0; i < b->nrooms; i++)
+            while (f < b->rooms[i].floor){ b->floorStart[++f] = i; }
+        while (f < b->nfloors) b->floorStart[++f] = b->nrooms;
     }
 
-    b->w = CORE_W + b->len;
-    b->d = CORR_W + 2 * ROOM_D;
+    /* --- enfilade doors: contiguous code running on into code ------ */
+    for (int f = 0; f < b->nfloors; f++)
+        for (int i = b->floorStart[f]; i + 1 < b->floorStart[f + 1]; i++){
+            Room *q = &b->rooms[i], *r = &b->rooms[i + 1];
+            if (q->row != r->row) continue;
+            if (q->kind == RT_GROUP || r->kind == RT_GROUP) continue;
+            if (!q->addr || !r->addr) continue;
+            if (q->addr + q->size + 16 < r->addr) continue;
+            /* they must actually share enough wall for a doorway */
+            float lo = q->z0 > r->z0 ? q->z0 : r->z0;
+            float hi = q->z1 < r->z1 ? q->z1 : r->z1;
+            if (hi - lo < DOOR_W + 0.4f) continue;
+            q->linkNext = i + 1; r->linkPrev = i;
+        }
+
+    b->w = CORE_W + b->plateW;
+    b->d = b->plateD;
     b->h = b->nfloors * FLOOR_H + 1.6f;
 }
 
@@ -551,6 +857,10 @@ City *city_build(Elf *e){
     City *c = calloc(1, sizeof(City));
     c->elf = e;
 
+    /* function boundaries survive stripping in the unwind tables */
+    Unitrange *units = NULL;
+    int nunits = ehframe_units(e, &units);
+
     int n = 0;
     for (int i = 0; i < e->nsec; i++)
         if (e->sec[i].type != 0 && e->sec[i].name[0]) n++;
@@ -558,7 +868,7 @@ City *city_build(Elf *e){
     for (int i = 0; i < e->nsec; i++){
         Sec *s = &e->sec[i];
         if (s->type == 0 || !s->name[0]) continue;
-        build_one(&c->bld[c->nbld], e, s);
+        build_one(&c->bld[c->nbld], e, s, units, nunits);
         s->bld = &c->bld[c->nbld];
         c->dcount[s->district]++;
         c->nbld++;
@@ -638,6 +948,18 @@ City *city_build(Elf *e){
             p->ang = 0.0f;
         }
     }
+    /* the far plane has to clear the ground quad, which runs GROUND_MARGIN
+       past the city on every side -- that, not tower height, is the term
+       that dominates                                                     */
+    {
+        float gw = (c->maxx - c->minx) + 2 * GROUND_MARGIN;
+        float gd = (c->maxz - c->minz) + 2 * GROUND_MARGIN;
+        float gh = 0;
+        for (int i = 0; i < c->nbld; i++) if (c->bld[i].h > gh) gh = c->bld[i].h;
+        c->farPlane = sqrtf(gw*gw + gd*gd + gh*gh) * 1.05f + 50.0f;
+    }
+
+    free(units);
     free(tmp);
     return c;
 }
@@ -652,6 +974,7 @@ void city_free(City *c){
             Room *r = &b->rooms[k];
             for (int j = 0; j < r->nlines; j++) free(r->lines[j]);
             free(r->lines);
+            free(r->units);
             disasm_free(r->dis); r->dis = NULL;   /* belt and braces */
         }
         free(b->rooms); free(b->floorStart);
