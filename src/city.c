@@ -32,7 +32,10 @@
 #define MAX_ROOMS_PER_BLD  200000
 #define LINES_PER_ROOM     22
 #define MAX_ROWS           24      /* comb rows per floor                */
-#define PLATE_MAX_SIDE     18.0f   /* the biggest room's grid, in metres */
+/* The biggest room's grid may run this far before the tile is squeezed.
+   It is a safety valve against one monster function, not a design driver:
+   floors are cheap, so a big plate is preferable to a stack of closets.  */
+#define PLATE_MAX_SIDE     40.0f
 
 static float clampf(float v, float a, float b){ return v < a ? a : (v > b ? b : v); }
 
@@ -580,11 +583,16 @@ static void room_metres(const Building *b, const Room *r, float *w, float *d){
     float t = b->tile;
     float ww = r->tw * t + 2 * TILE_MARGIN + 2 * WALL_T;
     float dd = r->th * t + TILE_MARGIN + TILE_SETBACK;
-    *w = ww < ROOM_W_MIN ? ROOM_W_MIN : ww;
-    *d = dd < ROOM_D_MIN ? ROOM_D_MIN : dd;
+    *w = ww < b->wmin ? b->wmin : ww;
+    *d = dd < b->dmin ? b->dmin : dd;
 }
 
 typedef struct { float used[MAX_ROWS], depth[MAX_ROWS]; int cnt[MAX_ROWS]; int nrow, count; } Fl;
+
+static int cmp_int(const void *a, const void *b){
+    int x = *(const int *)a, y = *(const int *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
 
 static int cmp_area_desc(const void *a, const void *b){
     const Room *const *x = a, *const *y = b;
@@ -597,12 +605,13 @@ static int cmp_area_desc(const void *a, const void *b){
 /* Places every room on a floor and a row.  Returns the floor count. */
 static int shelf_pack(Building *b, Room **ord, int n, float W, float D){
     float usable = W - CORR_W;                    /* the spine eats the rest */
-    Fl *fl = NULL; int nfl = 0, cap = 0;
+    Fl *fl = NULL; int nfl = 0, cap = 0, startf = 0;
     for (int i = 0; i < n; i++){
         Room *r = ord[i];
         float w, d; room_metres(b, r, &w, &d);
         int done = 0;
-        for (int f = 0; f < nfl && !done; f++){
+        while (startf < nfl && fl[startf].count >= MAXPF) startf++;
+        for (int f = startf; f < nfl && !done; f++){
             Fl *F = &fl[f];
             if (F->count >= MAXPF) continue;
             float usedD = 0;
@@ -730,13 +739,34 @@ static void build_one(Building *b, Elf *e, Sec *s,
     /* --- small units share a chamber ------------------------------ */
     b->nrooms = group_small(&b->rooms, b->nrooms);
 
-    /* --- metres per tile, so the biggest room stays walkable ------ */
+    /* --- metres per tile -----------------------------------------
+       Set from the *typical* room, not the largest.  Sizing off the
+       largest squeezes every other room down to the minimum, and since
+       a floor holds at most MAXPF rooms either way, the only thing that
+       buys is a more slender tower.  The largest room is merely capped. */
     int maxside = 1;
-    for (int i = 0; i < b->nrooms; i++)
-        if (b->rooms[i].tw > maxside) maxside = b->rooms[i].tw;
-    b->tile = TILE_M;
-    if (maxside * TILE_M > PLATE_MAX_SIDE) b->tile = PLATE_MAX_SIDE / (float)maxside;
-    if (b->tile < TILE_MIN) b->tile = TILE_MIN;
+    {
+        int nr = b->nrooms > 0 ? b->nrooms : 1;
+        int *sides = malloc((size_t)nr * sizeof(int));
+        for (int i = 0; i < b->nrooms; i++){
+            int sv = b->rooms[i].tw > b->rooms[i].th ? b->rooms[i].tw : b->rooms[i].th;
+            sides[i] = sv;
+            if (sv > maxside) maxside = sv;
+        }
+        qsort(sides, (size_t)nr, sizeof(int), cmp_int);
+        int med = b->nrooms > 0 ? sides[b->nrooms / 2] : 1;
+        if (med < 1) med = 1;
+        free(sides);
+        b->tile = ROOM_TYPICAL / (float)med;
+        if (b->tile > TILE_M) b->tile = TILE_M;
+        if (maxside * b->tile > PLATE_MAX_SIDE) b->tile = PLATE_MAX_SIDE / (float)maxside;
+        if (b->tile < TILE_MIN) b->tile = TILE_MIN;
+        /* and no room smaller than about half the typical one, so a
+           building of uniformly tiny units is not a stack of closets  */
+        float typ = med * b->tile + 2 * TILE_MARGIN + 2 * WALL_T;
+        b->wmin = clampf(typ * 0.55f, ROOM_W_MIN, 8.0f);
+        b->dmin = clampf(typ * 0.50f, ROOM_D_MIN, 7.0f);
+    }
 
     /* --- the floor plate: big enough for the largest room, and for a
            full quota of typical ones ------------------------------- */
@@ -764,7 +794,26 @@ static void build_one(Building *b, Elf *e, Sec *s,
     Room **ord = malloc((size_t)(b->nrooms ? b->nrooms : 1) * sizeof(Room *));
     for (int i = 0; i < b->nrooms; i++) ord[i] = &b->rooms[i];
     qsort(ord, (size_t)b->nrooms, sizeof(Room *), cmp_area_desc);
-    b->nfloors = shelf_pack(b, ord, b->nrooms, b->plateW, b->plateD);
+
+    /* The area bounds above can still leave a plate that does not
+       geometrically hold MAXPF rooms -- one wide room blocks a row.  Grow
+       and repack until the floor count stops falling: fewer floors on a
+       wider plate is exactly the surface-to-height trade we want.        */
+    int lb = (b->nrooms + MAXPF - 1) / MAXPF;
+    int bestF = shelf_pack(b, ord, b->nrooms, b->plateW, b->plateD);
+    float bestW = b->plateW, bestD = b->plateD;
+    float W = b->plateW, D = b->plateD;
+    /* One step may not cross a threshold -- a row only takes another room
+       once the plate has grown a whole room's width -- so keep going and
+       remember the smallest plate that gave the fewest floors.           */
+    for (int it = 0; it < 10 && bestF > lb; it++){
+        W *= ASPECT_STEP; D *= ASPECT_STEP;
+        int nf = shelf_pack(b, ord, b->nrooms, W, D);
+        if (nf < bestF){ bestF = nf; bestW = W; bestD = D; }
+    }
+    b->plateW = bestW; b->plateD = bestD;
+    b->nfloors = shelf_pack(b, ord, b->nrooms, bestW, bestD);
+    b->len = b->plateW;
     free(ord);
     if (b->nfloors < 1) b->nfloors = 1;
 

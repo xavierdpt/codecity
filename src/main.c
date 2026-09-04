@@ -227,8 +227,14 @@ static void goto_floor(App *a, int delta){
 /* ------------------------------------------------------------------ */
 
 static void step_towards(App *a, float tx, float tz, int steps){
+    /* budget from the distance, not a constant: plates are tens of metres
+       across now, and 4.5 m/s at 60 Hz is 7.5 cm a step                  */
+    float d0 = hypotf(tx - a->p.x, tz - a->p.z);
+    int need = (int)(d0 / (4.5f / 60.0f) * 1.8f) + 90;
+    if (need > steps) steps = need;
     for (int i = 0; i < steps; i++){
         float dx = tx - a->p.x, dz = tz - a->p.z;
+        if (dx*dx + dz*dz < 0.09f) break;            /* arrived */
         a->p.yaw = atan2f(dz, dx);
         player_update(a->city, &a->p, 4.5f / 60.0f, 0, 0, 1.0f / 60.0f);
     }
@@ -239,7 +245,7 @@ static int selftest(App *a){
     int fail = 0, tested = 0;
     for (int i = 0; i < c->nbld && tested < 8; i++){
         Building *b = &c->bld[i];
-        if (b->nfloors < 3) continue;
+        if (b->nfloors < 2) continue;
         tested++;
         /* start outside the front door */
         a->p.x = bld_x0(b) - 6.0f; a->p.z = b->bz; a->p.y = 0;
@@ -253,12 +259,16 @@ static int selftest(App *a){
         float r = 2.4f;
         step_towards(a, cx + r, cz, 260);          /* the foot of the flight */
         float ang = atan2f(a->p.z - cz, a->p.x - cx);
+        /* climb to this building's top, or three floors, whichever is less */
+        int ftarget = b->nfloors - 1;
+        if (ftarget > 3) ftarget = 3;
+        float ytarget = (float)ftarget * FLOOR_H;
         int guard = 0;
-        while (a->p.y < 3 * FLOOR_H - 0.3f && guard++ < 4000){
+        while (a->p.y < ytarget - 0.3f && guard++ < 4000){
             ang += 0.012f;
             step_towards(a, cx + cosf(ang) * r, cz + sinf(ang) * r, 2);
         }
-        if (a->p.y < 3 * FLOOR_H - 0.6f){
+        if (a->p.y < ytarget - 0.6f){
             printf("FAIL %-16s stuck on the stair at y=%.2f (floor %d, %d iters)\n",
                    b->label, a->p.y, a->p.floor, guard); fail++; continue;
         }
@@ -529,6 +539,22 @@ int main(int argc, char **argv){
                     int k = b->floorStart[f+1] - b->floorStart[f];
                     if (k < 1 || k > MAXPF) bad++;
                     hist[k < 11 ? k : 11]++; tot++;
+                }
+            }
+            {   /* how big are the rooms actually coming out, and how
+                   slender is the tower */
+                for (int i = 0; i < c->nbld; i++){
+                    Building *b = &c->bld[i];
+                    if (b->nrooms < 40) continue;
+                    float sw = 0, mx = 0, mn = 1e9f;
+                    for (int k = 0; k < b->nrooms; k++){
+                        float w = room_x1(b,&b->rooms[k]) - room_x0(b,&b->rooms[k]);
+                        sw += w; if (w > mx) mx = w; if (w < mn) mn = w;
+                    }
+                    printf("  %-16s room width min %.1f mean %.1f max %.1f m   "
+                           "plate %.0f  height %.0f  aspect 1:%.0f  %.1f rooms/floor\n",
+                           b->label, mn, sw / b->nrooms, mx, b->plateW, b->h,
+                           b->h / b->plateW, (float)b->nrooms / b->nfloors);
                 }
             }
             printf("rooms per floor:");

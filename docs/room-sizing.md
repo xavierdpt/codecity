@@ -3,49 +3,53 @@
 > **Implemented.** All of it, in `src/ehframe.[ch]` (new) and
 > `model.h`, `city.c`, `world.c`, `render.c`, `main.c`, `hud.c`.
 > `./elfcity --stats FILE` prints the layout the packer produced.
-> Measured after the fact, on four binaries, 0 floors fell outside 1..10 rooms:
 >
 > | | rooms | chambers (units) | recovered | tallest | far plane |
 > |---|---|---|---|---|---|
-> | `elfcity` | 291 | 138 (934) | 3 | 34 m / 8 fl | 1899 m |
-> | `git` (stripped) | 3156 | 568 (3959) | 2335 | 1714 m / 428 fl | 2577 m |
-> | `ssh` (stripped) | 643 | 116 (798) | 402 | 290 m / 72 fl | 1814 m |
-> | `busybox` (static) | 1948 | 525 (3647) | 1401 | 770 m / 192 fl | 1928 m |
+> | `elfcity` | 291 | 138 (934) | 3 | 26 m / 6 fl | 1904 m |
+> | `git` (stripped) | 3156 | 568 (3959) | 2335 | 1058 m / 264 fl | 2189 m |
+> | `ssh` (stripped) | 643 | 116 (798) | 402 | 182 m / 45 fl | 1854 m |
+> | `busybox` (static) | 1948 | 525 (3647) | 1401 | 726 m / 181 fl | 1949 m |
 >
-> `--selftest` passes on all of them (every tower entered and climbed), and
-> the whole build is clean under ASan and UBSan. Layout for `git` takes 25 ms.
-
-A design note for ELF City. It covers five changes asked for, plus §8 on making them
-meaningful for stripped binaries:
-
-1. Rooms in code buildings sized from the function / unit / section size, not from a
-   log curve.
-2. Between 1 and 10 rooms per floor, with bin packing to minimise the number of floors —
-   fast, not optimal.
-3. Corridors and padding inserted to absorb whatever the packer leaves over.
-4. The coloured byte squares that currently hang on the far wall of code rooms moved onto
-   the floor.
-5. The floor grid sized as the *most filled* rectangle for a given tile count — 15 tiles
-   gives 3×5, 17 tiles gives 4×5 rather than a 1×17 corridor.
-
-**Verdict: doable.** Points 1, 4 and 5 are local changes. Point 2 needs one genuine model
-change — a room has to gain a rectangle of its own (`z0, z1` alongside `x0, x1`), where
-today it has an extent along a single corridor and the compile-time depth `ROOM_D`. That
-ripples into eight call sites across `world.c`, `render.c` and `main.c`. Point 3 follows
-from it: with a 2-D floor plate the corridors become a comb rather than a single spine.
-
-Nothing here is blocked. Floors are nearly free — almost nothing about a floor is realized
-until you stand on it — so the 10-rooms-per-floor cap can produce very tall towers, and both
-`MAX_FLOORS` and `MAX_ROOMS_PER_BLD` can simply go. The one thing that must actually be
-fixed is the far plane, which turns out to be driven by the ground plane rather than by
-tower height; see [What actually breaks](#what-actually-breaks).
-
-The floor plate is derived from the largest unit in the building and the smaller units are
-packed in around it as filler — see §4, which is where most of the design is.
-
-§8 is a prerequisite in disguise: sizing rooms by content only means anything if the
-content is a *unit*, and on a stripped binary today it is an arbitrary 4 KiB slab. Function
-boundaries turn out to survive stripping in `.eh_frame`, exactly, in 99% of `/usr/bin`.
+> No floor falls outside 1..10 rooms, `--selftest` passes on all of them plus
+> a Go binary, and the build is clean under ASan and UBSan. Layout is 27 ms
+> for `git`.
+>
+> **One correction to §3 and §4, found by running it.** Sizing the tile from
+> the *largest* room (to cap it at `PLATE_MAX_SIDE`) squeezed every other room
+> down to the minimum: `git`'s `.text` came out with a 26 m plate, rooms
+> averaging 6.3 m, 6.2 rooms per floor and an aspect ratio of **1:67** — a
+> needle. Since a floor holds at most `MAXPF` rooms either way, shrinking the
+> rooms buys nothing but slenderness. Two changes fix it:
+>
+> - **Size the tile from the median room, not the largest** (`ROOM_TYPICAL`,
+>   7 m across), and treat `PLATE_MAX_SIDE` as a safety valve against one
+>   monster function rather than a design driver — it went from 18 m to 40 m.
+>   A per-building minimum room size, set at about half the typical room,
+>   stops a section of uniformly tiny units becoming a stack of closets.
+> - **Grow and repack until the floor count stops falling.** The area bounds
+>   of §4 can still leave a plate that does not *geometrically* hold ten
+>   rooms — one wide room blocks a whole row — which is why uniform sections
+>   like `.bss` and `.rela.dyn` were stuck at 4.0 rooms per floor. A single
+>   12% step often fails to cross a threshold, so the loop keeps going for up
+>   to ten steps and keeps the smallest plate that achieved the best count.
+>
+> | `git` section | before | after |
+> |---|---|---|
+> | `.text` | 26 m plate, 428 fl, 1714 m, 1:67, 6.2/floor | **91 m, 264 fl, 1058 m, 1:12, 10.0/floor** |
+> | `.rela.dyn` | 19 m, 1:11, 4.0/floor | **29 m, 1:3, 9.8/floor** |
+> | `.bss` | 17 m, 1:3, 4.0/floor | **24 m, 1:1, 8.8/floor** |
+>
+> Across the whole `git` city that is 548 floors down to 336, with 298 of them
+> holding the full ten rooms.
+>
+> **A pre-existing bug fell out of this.** The spiral stair generated a full
+> extra turn *above* the top landing (`stair_height()`, `src/world.c`), so in
+> any building you could climb past the top floor onto treads that led
+> nowhere and be stranded. It was invisible only because the self-test
+> skipped buildings under three floors and stopped climbing at floor 3. The
+> stair now stops at `(nfloors-1) * FLOOR_H`, and the test climbs to each
+> building's own top.
 
 ---
 

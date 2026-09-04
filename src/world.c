@@ -135,9 +135,13 @@ float stair_height(const Building *b, float wx, float wz, float curY){
     if (a < 0) a += TAU;
     int step = (int)(a / TAU * STEPS_PER_FLOOR);
     float frac = (float)step / (float)STEPS_PER_FLOOR;
+    /* the spiral stops at the top landing: a full extra turn above it
+       would be treads you can climb onto and then be stranded on        */
+    float top = (float)(b->nfloors - 1) * FLOOR_H;
     float best = -1e9f;
     for (int k = 0; k < b->nfloors; k++){
         float h = ((float)k + frac) * FLOOR_H;
+        if (h > top + 0.001f) break;
         if (h <= curY + STEP_UP && h > best) best = h;
     }
     return best;

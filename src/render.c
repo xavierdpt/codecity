@@ -194,10 +194,12 @@ static void draw_stair(const Building *b, int f0, int f1){
     if (f0 < 0) f0 = 0;
     if (f1 > b->nfloors - 1) f1 = b->nfloors - 1;
     float t = 0.16f;
+    float ytop = (float)(b->nfloors - 1) * FLOOR_H;
     glBegin(GL_QUADS);
     for (int k = f0; k <= f1; k++){
         for (int j = 0; j < STEPS_PER_FLOOR; j++){
             float y = ((float)k + (float)j / STEPS_PER_FLOOR) * FLOOR_H;
+            if (y > ytop + 0.001f) break;
             float a0 = (float)j / STEPS_PER_FLOOR * TAU;
             float a1 = (float)(j + 1) / STEPS_PER_FLOOR * TAU;
             if (j & 1) glColor3f(0.58f, 0.55f, 0.50f); else glColor3f(0.64f, 0.61f, 0.56f);
@@ -219,6 +221,7 @@ static void draw_stair(const Building *b, int f0, int f1){
     for (int k = f0; k <= f1; k++)
         for (int j = 0; j < STEPS_PER_FLOOR; j += 2){
             float y = ((float)k + (float)j / STEPS_PER_FLOOR) * FLOOR_H;
+            if (y > ytop + 0.001f) break;
             float a = (float)j / STEPS_PER_FLOOR * TAU;
             float x = cx + (STAIR_ROUT - 0.12f) * cosf(a), z = cz + (STAIR_ROUT - 0.12f) * sinf(a);
             draw_box(x - 0.05f, y, z - 0.05f, x + 0.05f, y + 0.95f, z + 0.05f);

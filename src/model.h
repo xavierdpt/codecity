@@ -110,8 +110,10 @@ const char *elf_reltype_name(int machine, uint32_t t);
 #define TILE_MIN    0.22f
 #define TILE_MARGIN 0.70f   /* clear strip between the grid and the walls   */
 #define TILE_SETBACK 1.20f  /* clear strip inside the door                  */
-#define ROOM_W_MIN  2.60f
+#define ROOM_W_MIN  2.60f   /* absolute floor: you must fit through it     */
 #define ROOM_D_MIN  2.40f
+#define ROOM_TYPICAL 7.0f   /* what a median room should measure across     */
+#define ASPECT_STEP 1.12f   /* plate growth per repack attempt              */
 #define MAXPF       10      /* rooms per floor, hard cap                    */
 #define PLATE_FILL  0.62f   /* assumed packing efficiency when sizing a plate */
 #define GROUP_TILES 64      /* units at or below this share a chamber       */
@@ -187,6 +189,7 @@ typedef struct Building {
     float       bx, bz;             /* world position of local origin  */
     float       plateW, plateD;     /* the floor plate, every floor alike */
     float       tile;               /* metres per content tile         */
+    float       wmin, dmin;         /* this building's smallest room   */
     float       len;                /* == plateW, kept for the exterior */
     float       w, d, h;            /* overall footprint + height      */
     float       col[3];
