@@ -145,35 +145,75 @@ static void browser_open(App *a){
 
 static void room_lifecycle(App *a){
     int bi = a->p.inside, ri = a->p.room;
-    /* a chamber holds several units: decode the alcove being stood at, and
-       swap when the visitor moves to another one                          */
-    int ui = -1;
-    if (bi >= 0 && ri >= 0){
-        Building *b = &a->city->bld[bi];
-        if (ri < b->nrooms && b->rooms[ri].kind == RT_GROUP)
-            ui = room_unit_at(b, &b->rooms[ri], a->p.x, a->p.z);
-    }
-    if (bi != a->lastB || ri != a->lastR || ui != a->lastU){
-        if (bi >= 0 && ri >= 0){
-            if (ui >= 0) city_enter_unit(a->city, bi, ri, ui);
-            else         city_enter_room(a->city, bi, ri);
-        } else city_leave_room(a->city);
-        a->lastB = bi; a->lastR = ri; a->lastU = ui;
+    /* The whole room is decoded on the way in -- a chamber included, so all
+       seven of its alcoves are lit at once.  The alcove being stood at only
+       decides which sculpture is close enough to read.                   */
+    if (bi != a->lastB || ri != a->lastR){
+        if (bi >= 0 && ri >= 0) city_enter_room(a->city, bi, ri);
+        else                    city_leave_room(a->city);
+        a->lastB = bi; a->lastR = ri; a->lastU = -1;
         a->nearIns = -1;
     }
-    /* which sculpture are we standing next to? */
     a->nearIns = -1;
-    if (bi >= 0 && ri >= 0){
-        Room *r = &a->city->bld[bi].rooms[ri];
-        if (r->dis && r->dis->laid){
-            float best = 2.6f * 2.6f;
-            for (int i = 0; i < r->dis->n; i++){
-                float dx = r->dis->ins[i].x - a->p.x, dz = r->dis->ins[i].z - a->p.z;
-                float d2 = dx*dx + dz*dz;
-                if (d2 < best){ best = d2; a->nearIns = i; }
-            }
+    if (bi < 0 || ri < 0) return;
+    Room *r = &a->city->bld[bi].rooms[ri];
+    if (r->kind == RT_GROUP)
+        r->activeUnit = room_unit_at(&a->city->bld[bi], r, a->p.x, a->p.z);
+    a->lastU = r->activeUnit;
+
+    /* which sculpture are we standing next to? */
+    Disasm *d = room_dis(r);
+    if (d && d->laid){
+        float best = 2.6f * 2.6f;
+        for (int i = 0; i < d->n; i++){
+            float dx = d->ins[i].x - a->p.x, dz = d->ins[i].z - a->p.z;
+            float d2 = dx*dx + dz*dz;
+            if (d2 < best){ best = d2; a->nearIns = i; }
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* going somewhere                                                     */
+/* ------------------------------------------------------------------ */
+
+/* stand in the middle of a room, looking at its far wall */
+static void stand_in_room(App *a, int bi, int ri){
+    Building *b = &a->city->bld[bi];
+    Room *r = &b->rooms[ri];
+    floor_realize(b, r->floor);
+    float mid = (room_x0(b, r) + room_x1(b, r)) * 0.5f;
+    float depth = room_z1(b, r) - room_z0(b, r);
+    a->p.x = mid;
+    a->p.y = r->floor * FLOOR_H;
+    a->p.z = room_z0(b, r) + (depth < 2.4f ? depth * 0.5f : 1.2f);
+    a->p.yaw = (float)M_PI * 0.5f;                 /* looking into the room, +Z */
+    a->p.pitch = 0.02f;
+    a->p.vy = 0;
+    a->p.inside = bi; a->p.floor = r->floor; a->p.room = ri;
+}
+
+/* step through a port: land in the room that holds the address it names */
+static void teleport_addr(App *a, uint64_t addr, const char *what){
+    int bi, ri, ui;
+    if (!city_find_addr(a->city, addr, &bi, &ri, &ui)){
+        app_message(a, "0x%llx is not in this file", (unsigned long long)addr);
+        return;
+    }
+    Building *b = &a->city->bld[bi];
+    Room *r = &b->rooms[ri];
+    stand_in_room(a, bi, ri);
+    if (ui >= 0){                     /* a chamber: stand at that alcove */
+        float x0, z0, x1, z1;
+        if (room_cell_rect(b, r, ui, &x0, &z0, &x1, &z1)){
+            a->p.x = (x0 + x1) * 0.5f;
+            a->p.z = z0 - 0.6f > room_z0(b, r) ? z0 - 0.6f : (z0 + z1) * 0.5f;
+        }
+    }
+    a->lastB = a->lastR = -2;         /* force the new room to be decoded */
+    room_lifecycle(a);
+    app_message(a, "%s  --  %s / %s / floor %d", what ? what : r->title,
+                b->label, r->title, r->floor + 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -181,10 +221,19 @@ static void room_lifecycle(App *a){
 /* ------------------------------------------------------------------ */
 
 static void update_prompt(App *a){
-    a->prompt[0] = 0; a->promptKind = 0; a->promptIdx = -1;
+    a->prompt[0] = 0; a->promptKind = 0; a->promptIdx = -1; a->promptAddr = 0;
     City *c = a->city;
     Player *p = &a->p;
-    if (p->inside >= 0) return;
+    if (p->inside >= 0){
+        uint64_t addr = 0; const char *label = NULL;
+        if (render_pick_port(a, &addr, &label)){
+            snprintf(a->prompt, sizeof a->prompt, "[E / click]  go to %s",
+                     label && label[0] ? label : "there");
+            a->promptKind = 3; a->promptAddr = addr;
+            snprintf(a->promptName, sizeof a->promptName, "%s", label ? label : "");
+        }
+        return;
+    }
     float best = 7.0f * 7.0f; int hit = -1;
     for (int i = 0; i < c->nportal; i++){
         float dx = p->x - c->portal[i].x, dz = p->z - c->portal[i].z;
@@ -210,6 +259,10 @@ static void update_prompt(App *a){
 }
 
 static void interact(App *a){
+    if (a->promptKind == 3 && a->promptAddr){
+        teleport_addr(a, a->promptAddr, a->promptName);
+        return;
+    }
     if (a->promptKind == 1 && a->promptIdx >= 0){
         Portal *po = &a->city->portal[a->promptIdx];
         if (po->path[0]) load_file(a, po->path);
@@ -248,6 +301,49 @@ static void step_towards(App *a, float tx, float tz, int steps){
         a->p.yaw = atan2f(dz, dx);
         player_update(a->city, &a->p, 4.5f / 60.0f, 0, 0, 1.0f / 60.0f);
     }
+}
+
+/* Every port must be aimable and must lead somewhere in the city.  Stands
+   at the door of a code room, looks at each port in turn and steps through
+   it, then checks the address really is in the room it landed in.        */
+static int test_ports(App *a, int bi, const char **why, int *nok){
+    City *c = a->city;
+    Building *b = &c->bld[bi];
+    int found = 0, checked = 0;
+    for (int k = b->floorStart[0]; k < b->floorStart[1] && !found; k++){
+        Room *r = &b->rooms[k];
+        if (r->kind != RT_FUNC) continue;
+        city_enter_room(c, bi, k);
+        if (!r->dis || !r->dis->nports){ city_leave_room(c); continue; }
+        found = 1;
+        code_layout(r->dis, b, room_x0(b, r), room_x1(b, r),
+                    room_z0(b, r), room_z1(b, r), r->floor * FLOOR_H);
+        for (int i = 0; i < r->dis->nports && i < 6; i++){
+            /* stand just inside the door and look straight at the port */
+            Port want = r->dis->ports[i];
+            a->p.inside = bi; a->p.floor = r->floor; a->p.room = k;
+            a->p.x = (room_x0(b, r) + room_x1(b, r)) * 0.5f;
+            a->p.z = room_z0(b, r) + 0.9f;
+            a->p.y = r->floor * FLOOR_H;
+            float dx = want.x - a->p.x, dy = want.y - (a->p.y + EYE_H), dz = want.z - a->p.z;
+            a->p.yaw = atan2f(dz, dx);
+            a->p.pitch = atan2f(dy, sqrtf(dx*dx + dz*dz));
+            uint64_t got = 0; const char *lab = NULL;
+            if (!render_pick_port(a, &got, &lab)){ *why = "a port could not be aimed at"; return 1; }
+            if (got != want.addr){ *why = "aiming at one port picked another"; return 1; }
+            int tb, tr, tu;
+            if (!city_find_addr(c, got, &tb, &tr, &tu)) continue;   /* not in this file */
+            Room *dst = &c->bld[tb].rooms[tr];
+            uint64_t at = (tu >= 0) ? dst->units[tu].addr : dst->addr;
+            if (got < at){ *why = "a port led to a room that starts after it"; return 1; }
+            checked++;
+        }
+        city_leave_room(c);
+    }
+    *nok = checked;
+    if (!found) return 0;
+    if (!checked){ *why = "no port led anywhere in the file"; return 1; }
+    return 0;
 }
 
 static int selftest(App *a){
@@ -308,10 +404,19 @@ static int selftest(App *a){
         step_towards(a, doorx, room_z0(b, rm) + (depth < 3.0f ? depth * 0.5f : 1.6f), 300);
         int got = room_at(c, &a->p);
         /* entering decodes the room; leaving must free it */
-        city_enter_room(c, i, got >= 0 ? got : target);
-        int decoded = (got >= 0 && b->rooms[got].dis) ? b->rooms[got].dis->n : 0;
-        if (disasm_live() > 1){
-            printf("FAIL %-16s %d decodings alive at once\n", b->label, disasm_live());
+        int in_room = got >= 0 ? got : target;
+        city_enter_room(c, i, in_room);
+        Room *ir = &b->rooms[in_room];
+        int decoded = ir->dis ? ir->dis->n : 0;
+        int budget = 1;                        /* a chamber lights every alcove */
+        if (ir->kind == RT_GROUP){
+            budget = ir->nunits;
+            for (int u = 0; u < ir->nunits; u++)
+                if (ir->units[u].dis) decoded += ir->units[u].dis->n;
+        }
+        if (disasm_live() > budget){
+            printf("FAIL %-16s %d decodings alive at once, room holds %d\n",
+                   b->label, disasm_live(), budget);
             fail++; continue;
         }
         city_leave_room(c);
@@ -323,9 +428,14 @@ static int selftest(App *a){
             printf("FAIL %-16s could not get through the door of '%s' (in room %d, wanted %d)\n",
                    b->label, rm->title, got, target); fail++; continue;
         }
-        if (decoded) printf("ok   %-16s door -> spiral -> floor %d -> room '%s'  (%d instructions, freed on exit)\n",
-                            b->label, f + 1, rm->title, decoded);
-        else         printf("ok   %-16s door -> spiral -> floor %d -> room '%s'\n", b->label, f + 1, rm->title);
+        const char *why = NULL; int nport = 0;
+        if (test_ports(a, i, &why, &nport)){
+            printf("FAIL %-16s %s\n", b->label, why); fail++; continue;
+        }
+        if (decoded) printf("ok   %-16s door -> spiral -> floor %d -> room '%s'  (%d instructions, %d ports followed, freed on exit)\n",
+                            b->label, f + 1, rm->title, decoded, nport);
+        else         printf("ok   %-16s door -> spiral -> floor %d -> room '%s'  (%d ports followed)\n",
+                            b->label, f + 1, rm->title, nport);
     }
     if (disasm_live() != 0){ printf("FAIL %d decodings still alive at the end\n", disasm_live()); fail++; }
     printf("%s [%s]: %d towers tested, %d failed\n",
@@ -356,21 +466,6 @@ static int find_bld(App *a, const char *name){
     for (int i = 0; i < a->city->nbld; i++)
         if (!strcmp(a->city->bld[i].label, name)) return i;
     return -1;
-}
-
-/* stand in the middle of a room, looking at its far wall */
-static void stand_in_room(App *a, int bi, int ri){
-    Building *b = &a->city->bld[bi];
-    Room *r = &b->rooms[ri];
-    floor_realize(b, r->floor);
-    float mid = (room_x0(b, r) + room_x1(b, r)) * 0.5f;
-    float depth = room_z1(b, r) - room_z0(b, r);
-    a->p.x = mid;
-    a->p.y = r->floor * FLOOR_H;
-    a->p.z = room_z0(b, r) + (depth < 2.4f ? depth * 0.5f : 1.2f);
-    a->p.yaw = (float)M_PI * 0.5f;                 /* looking into the room, +Z */
-    a->p.pitch = 0.02f;
-    a->p.inside = bi; a->p.floor = r->floor; a->p.room = ri;
 }
 
 static void shot(App *a, const char *dir, const char *name){
@@ -497,9 +592,32 @@ static int shot_mode(App *a, const char *dir){
             a->p.inside = gb; a->p.floor = rr->floor; a->p.room = gr;
             room_lifecycle(a);
             shot(a, dir, "14-chamber");
-            printf("  chamber '%s': %d units, active alcove %d, %s\n",
-                   rr->title, rr->nunits, rr->activeUnit,
-                   rr->dis ? "alcove decoded" : "NOT decoded");
+            int lit = 0;
+            for (int u = 0; u < rr->nunits; u++) if (rr->units[u].dis) lit++;
+            printf("  chamber '%s': %d units, %d decoded, standing at alcove %d\n",
+                   rr->title, rr->nunits, lit, rr->activeUnit);
+            city_leave_room(c);
+        }
+    }
+
+    {   /* a room small enough to see its far wall, so the ports read */
+        int pb = -1, pr = -1, bestn = 0;
+        for (int f = 0; f < cb->nfloors && f < 12 && bestn < 9; f++)
+            for (int k = cb->floorStart[f]; k < cb->floorStart[f+1]; k++){
+                Room *rr = &cb->rooms[k];
+                if (rr->kind != RT_FUNC || rr->size < 250 || rr->size > 1400) continue;
+                city_enter_room(c, cbi, k);
+                int np = rr->dis ? rr->dis->nports : 0;
+                city_leave_room(c);
+                if (np > bestn){ bestn = np; pb = cbi; pr = k; }
+            }
+        if (pr >= 0){
+            stand_in_room(a, pb, pr);
+            a->p.pitch = 0.06f;
+            shot(a, dir, "15-ports");
+            Room *rr = &cb->rooms[pr];
+            printf("  ports: room '%s' has %d exits by %d ports\n", rr->title,
+                   rr->dis ? rr->dis->nexits : 0, rr->dis ? rr->dis->nports : 0);
             city_leave_room(c);
         }
     }
@@ -519,12 +637,13 @@ int main(int argc, char **argv){
     a->lastB = a->lastR = a->lastU = -2; a->nearIns = -1;
 
     const char *start = NULL, *shotdir = NULL;
-    int dotest = 0, dobench = 0, dostats = 0;
+    int dotest = 0, dobench = 0, dostats = 0, gpudebug = 0;
     for (int i = 1; i < argc; i++){
         if (!strcmp(argv[i], "--shot") && i + 1 < argc){ shotdir = argv[++i]; continue; }
         if (!strcmp(argv[i], "--selftest")){ dotest = 1; continue; }
         if (!strcmp(argv[i], "--bench")){ dobench = 1; continue; }
         if (!strcmp(argv[i], "--stats")){ dostats = 1; continue; }
+        if (!strcmp(argv[i], "--gpudebug")){ gpudebug = 1; continue; }
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")){
             printf("usage: %s [options] [binary-or-library]\n"
                    "\n"
@@ -534,6 +653,11 @@ int main(int argc, char **argv){
                    "  --shot DIR    render a set of canned viewpoints into DIR as .ppm and exit\n"
                    "  --selftest    headless check that every tower can be entered and climbed\n"
                    "  --stats       print the layout the packer produced, and exit\n"
+                   "  --gpudebug    MESA_DEBUG=1 and GALLIUM_HUD=fps,VRAM-usage, for telling a\n"
+                   "                stall in this program from one in the driver.  An existing\n"
+                   "                value in the environment is left alone, which is how to get\n"
+                   "                a useful HUD on Intel: VRAM-usage is a radeonsi/nouveau\n"
+                   "                query, so try GALLIUM_HUD=fps,frametime,cpu instead.\n"
                    "  -h, --help    this text\n", argv[0]);
             return 0;
         }
@@ -544,6 +668,24 @@ int main(int argc, char **argv){
         for (int i = 0; cand[i] && !start; i++) if (!access(cand[i], R_OK)) start = cand[i];
     }
     if (!start){ fprintf(stderr, "give me an ELF file to explore\n"); return 1; }
+
+    /* Mesa reads both of these when the driver comes up, so they have to be
+       in the environment before SDL touches GL.  The HUD draws over the top
+       left of the window; VRAM-usage is the one that shows the glyph cache
+       and the exterior display lists growing.                            */
+    if (gpudebug){
+        static const struct { const char *k, *v; } ENV[] = {
+            { "MESA_DEBUG",  "1" },
+            { "GALLIUM_HUD", "fps,VRAM-usage" },
+        };
+        for (size_t i = 0; i < sizeof ENV / sizeof *ENV; i++){
+            const char *had = getenv(ENV[i].k);
+            if (had && had[0]) fprintf(stderr, "gpu debug: %s=%s (from the environment)\n",
+                                       ENV[i].k, had);
+            else { setenv(ENV[i].k, ENV[i].v, 1);
+                   fprintf(stderr, "gpu debug: %s=%s\n", ENV[i].k, ENV[i].v); }
+        }
+    }
 
     if (dostats){
         char err[256];
@@ -686,6 +828,11 @@ int main(int argc, char **argv){
         return 0;
     }
 
+    /* This is a window, not a fullscreen game.  Asking the compositor to
+       unredirect it makes Mutter redirect and unredirect on every focus
+       change, which is one of the ways an alt-tab turns into a stall.   */
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
+
     if (SDL_Init(SDL_INIT_VIDEO) != 0){
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1;
     }
@@ -761,7 +908,11 @@ int main(int argc, char **argv){
     }
 
     SDL_SetRelativeMouseMode(SDL_TRUE);
-    int mouseLook = 1, running = 1;
+    /* mouseLook is what the visitor asked for; the pointer grab is only
+       actually held while we have focus.  Relative mode is an XGrabPointer
+       under X11 and XWayland, and a grab still held by a window the
+       compositor is switching away from is how alt-tab locks up a desktop. */
+    int mouseLook = 1, running = 1, focused = 1, visible = 1, swallowMotion = 0;
     Uint64 prev = SDL_GetPerformanceCounter();
     double freq = (double)SDL_GetPerformanceFrequency();
     float fpsAcc = 0; int fpsN = 0;
@@ -770,8 +921,31 @@ int main(int argc, char **argv){
         SDL_Event ev;
         while (SDL_PollEvent(&ev)){
             if (ev.type == SDL_QUIT) running = 0;
-            else if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED){
-                a->winw = ev.window.data1; a->winh = ev.window.data2;
+            else if (ev.type == SDL_WINDOWEVENT){
+                switch (ev.window.event){
+                case SDL_WINDOWEVENT_SIZE_CHANGED:
+                    a->winw = ev.window.data1; a->winh = ev.window.data2;
+                    break;
+                case SDL_WINDOWEVENT_FOCUS_LOST:
+                    focused = 0;
+                    SDL_SetRelativeMouseMode(SDL_FALSE);   /* let go of the pointer */
+                    break;
+                case SDL_WINDOWEVENT_FOCUS_GAINED:
+                    focused = 1;
+                    swallowMotion = 1;                     /* drop the catch-up jump */
+                    if (mouseLook && !a->showBrowser) SDL_SetRelativeMouseMode(SDL_TRUE);
+                    break;
+                case SDL_WINDOWEVENT_MINIMIZED: case SDL_WINDOWEVENT_HIDDEN:
+                    visible = 0;
+                    break;
+                case SDL_WINDOWEVENT_RESTORED: case SDL_WINDOWEVENT_SHOWN:
+                case SDL_WINDOWEVENT_EXPOSED:
+                    visible = 1;
+                    break;
+                }
+            }
+            else if (ev.type == SDL_MOUSEMOTION && swallowMotion){
+                swallowMotion = 0;
             }
             else if (ev.type == SDL_MOUSEMOTION && mouseLook && !a->showBrowser){
                 a->p.yaw   += ev.motion.xrel * 0.0026f;
@@ -779,8 +953,9 @@ int main(int argc, char **argv){
                 if (a->p.pitch >  1.52f) a->p.pitch =  1.52f;
                 if (a->p.pitch < -1.52f) a->p.pitch = -1.52f;
             }
-            else if (ev.type == SDL_MOUSEBUTTONDOWN && !mouseLook && !a->showBrowser){
-                mouseLook = 1; SDL_SetRelativeMouseMode(SDL_TRUE);
+            else if (ev.type == SDL_MOUSEBUTTONDOWN && !a->showBrowser){
+                if (!mouseLook){ mouseLook = 1; SDL_SetRelativeMouseMode(SDL_TRUE); }
+                else if (ev.button.button == SDL_BUTTON_LEFT) interact(a);
             }
             else if (ev.type == SDL_TEXTINPUT && a->showBrowser){
                 size_t l = strlen(a->bfilter);
@@ -842,6 +1017,15 @@ int main(int argc, char **argv){
             }
         }
 
+        /* A minimised window gets no frame callbacks, so swapping into it can
+           block for as long as it stays hidden.  Wait on the event queue
+           instead -- that is a wait we control and can be woken from.     */
+        if (!visible){
+            SDL_WaitEventTimeout(NULL, 120);
+            prev = SDL_GetPerformanceCounter();
+            continue;
+        }
+
         Uint64 now = SDL_GetPerformanceCounter();
         float dt = (float)((now - prev) / freq);
         prev = now;
@@ -872,7 +1056,16 @@ int main(int argc, char **argv){
 
         render_scene(a);
         hud_draw(a);
+        Uint64 sw0 = SDL_GetPerformanceCounter();
         SDL_GL_SwapWindow(win);
+        a->swapMs = (float)((SDL_GetPerformanceCounter() - sw0) / freq * 1000.0);
+        if (a->swapMs > a->stallMs) a->stallMs = a->swapMs;
+        if (a->swapMs > 250.0f)
+            fprintf(stderr, "stall: %.0f ms inside SDL_GL_SwapWindow -- the frame was "
+                            "drawn, the compositor or driver held it\n", a->swapMs);
+
+        /* behind another window there is nothing to animate for */
+        if (!focused) SDL_Delay(24);
     }
 
     for (int i = 0; i < a->nbent; i++) free(a->bent[i]);

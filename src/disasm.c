@@ -2,7 +2,8 @@
  *
  * One handle is kept open for the architecture of the file being explored.
  * Rooms are decoded on entry and thrown away on the way out, so at most one
- * room's worth of instructions is ever allocated.
+ * room's worth of instructions is ever allocated -- a chamber counting as
+ * one room, however many alcoves it holds.
  */
 #define _GNU_SOURCE
 #include "disasm.h"
@@ -116,7 +117,7 @@ static void cpy(char *d, size_t n, const char *s){
     d[l] = 0;
 }
 
-int g_disasm_live;      /* live room decodings -- must be 0 or 1 at all times */
+int g_disasm_live;      /* live decodings -- one room's worth at a time */
 
 Disasm *disasm_run(const uint8_t *code, uint64_t len, uint64_t vaddr, int maxins){
     if (!g_open || !code || !len) return NULL;
@@ -133,7 +134,7 @@ Disasm *disasm_run(const uint8_t *code, uint64_t len, uint64_t vaddr, int maxins
         t->addr = ins[i].address;
         t->len  = (uint16_t)ins[i].size;
         t->cls  = (uint8_t)classify(&ins[i]);
-        t->target = -1;
+        t->target = -1; t->tunit = -1; t->port = -1;
         cpy(t->mnem, sizeof t->mnem, ins[i].mnemonic);
         cpy(t->ops,  sizeof t->ops,  ins[i].op_str);
         /* a direct branch prints its destination as a bare address */
@@ -147,13 +148,7 @@ Disasm *disasm_run(const uint8_t *code, uint64_t len, uint64_t vaddr, int maxins
     /* resolve the branches that land inside this room */
     for (int i = 0; i < d->n; i++){
         if (!d->ins[i].taddr) continue;
-        uint64_t want = d->ins[i].taddr;
-        int lo = 0, hi = d->n - 1, at = -1;
-        while (lo <= hi){
-            int mid = (lo + hi) / 2;
-            if (d->ins[mid].addr == want){ at = mid; break; }
-            if (d->ins[mid].addr < want) lo = mid + 1; else hi = mid - 1;
-        }
+        int at = disasm_index_of(d, d->ins[i].taddr);
         if (at >= 0){ d->ins[i].target = at; d->nlinks++; }
         else d->nexits++;
     }
@@ -162,8 +157,67 @@ Disasm *disasm_run(const uint8_t *code, uint64_t len, uint64_t vaddr, int maxins
     return d;
 }
 
+int disasm_index_of(const Disasm *d, uint64_t addr){
+    if (!d || !d->n) return -1;
+    int lo = 0, hi = d->n - 1;
+    while (lo <= hi){
+        int mid = (lo + hi) / 2;
+        if (d->ins[mid].addr == addr) return mid;
+        if (d->ins[mid].addr < addr) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
+static int cmp_u64(const void *a, const void *b){
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* One port per distinct destination, in address order so the wall reads
+   the same way twice.  Anything still unresolved after the cross-alcove
+   pass leaves the room, so it needs a way out.                          */
+void disasm_ports(Disasm *d){
+    if (!d) return;
+    free(d->ports); d->ports = NULL; d->nports = 0;
+    int nex = 0;
+    for (int i = 0; i < d->n; i++){
+        d->ins[i].port = -1;
+        if (d->ins[i].target < 0 && d->ins[i].taddr) nex++;
+    }
+    if (!nex) return;
+
+    uint64_t *a = malloc((size_t)nex * sizeof *a);
+    int na = 0;
+    for (int i = 0; i < d->n; i++)
+        if (d->ins[i].target < 0 && d->ins[i].taddr) a[na++] = d->ins[i].taddr;
+    qsort(a, (size_t)na, sizeof *a, cmp_u64);
+    int m = 0;
+    for (int i = 0; i < na; i++) if (!m || a[i] != a[m-1]) a[m++] = a[i];
+
+    d->ports = calloc((size_t)m, sizeof(Port));
+    d->nports = m;
+    for (int i = 0; i < m; i++){ d->ports[i].addr = a[i]; d->ports[i].cls = IC_JUMP; }
+    free(a);
+
+    for (int i = 0; i < d->n; i++){
+        Insn *t = &d->ins[i];
+        if (t->target >= 0 || !t->taddr) continue;
+        int lo = 0, hi = d->nports - 1, at = -1;
+        while (lo <= hi){
+            int mid = (lo + hi) / 2;
+            if (d->ports[mid].addr == t->taddr){ at = mid; break; }
+            if (d->ports[mid].addr < t->taddr) lo = mid + 1; else hi = mid - 1;
+        }
+        if (at < 0) continue;
+        t->port = at;
+        if (!d->ports[at].n) d->ports[at].cls = t->cls;
+        d->ports[at].n++;
+    }
+}
+
 void disasm_free(Disasm *d){
     if (!d) return;
+    free(d->ports);
     free(d->ins);
     free(d);
     g_disasm_live--;

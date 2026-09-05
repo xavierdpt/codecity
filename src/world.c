@@ -123,6 +123,99 @@ void emit_ceiling(const Building *b, int fl, BoxSink f, void *ud){
 }
 
 /* ------------------------------------------------------------------ */
+/* the furniture of a decoded room                                     */
+/* ------------------------------------------------------------------ */
+
+static float class_lift(int c){
+    switch (c){
+    case IC_CALL:   return 0.55f;
+    case IC_JUMP:   return 0.34f;
+    case IC_CJUMP:  return 0.26f;
+    case IC_SYSCALL:return 0.62f;
+    case IC_RET:    return 0.02f;
+    case IC_NOP:    return -0.14f;
+    default:        return 0.0f;
+    }
+}
+
+/* serpentine ribbon across the room floor, so consecutive instructions touch */
+static void layout_code(Disasm *d, const Building *b, float x0, float x1,
+                        float zn, float zf, float base){
+    float dir = (zf > zn) ? 1.0f : -1.0f;
+    float usableW = x1 - x0 - 2 * TILE_MARGIN;
+    float usableD = fabsf(zf - zn) - TILE_SETBACK - TILE_MARGIN;
+    if (usableW < 1.0f) usableW = 1.0f;
+    if (usableD < 1.0f) usableD = 1.0f;
+    /* the room was sized from one tile per instruction, so start there
+       and only shrink if the real decode came out longer than estimated */
+    float pitch = b->tile;
+    int cols = 1, rows = 1;
+    for (;;){
+        cols = (int)(usableW / pitch); if (cols < 1) cols = 1;
+        rows = (int)(usableD / pitch); if (rows < 1) rows = 1;
+        if (cols * rows >= d->n || pitch <= 0.20f) break;
+        pitch *= 0.93f;
+    }
+    d->pitch = pitch; d->cols = cols; d->rows = rows;
+    float gx = x0 + TILE_MARGIN + (usableW - cols * pitch) * 0.5f;
+    for (int i = 0; i < d->n; i++){
+        Insn *t = &d->ins[i];
+        int row = i / cols, col = i % cols;
+        if (row & 1) col = cols - 1 - col;               /* boustrophedon */
+        if (row >= rows) row = rows - 1;                 /* overflow piles on the last row */
+        t->x = gx + (col + 0.5f) * pitch;
+        t->z = zn + dir * (TILE_SETBACK + (row + 0.5f) * pitch);
+        t->y = base;
+        t->h = clampf(0.22f + t->len * 0.075f + class_lift(t->cls), 0.06f, 1.55f);
+    }
+}
+
+/* One panel per destination, ranked across the far wall.  Panels are a
+   fixed signboard size until there are too many to fit, and only then do
+   they shrink -- so four exits read as four doors, not four billboards. */
+static void layout_ports(Disasm *d, float x0, float x1, float zn, float zf, float base){
+    int n = d->nports;
+    if (n < 1) return;
+    float dir = (zf > zn) ? 1.0f : -1.0f;
+    float W = (x1 - x0) - 0.70f;
+    float H = PORT_TOP - PORT_BOT;
+    if (W < 0.40f) W = 0.40f;
+
+    float ch = PORT_H_MAX * 1.30f;             /* cell, panel plus its gap */
+    int cols = 1, rows = n;
+    for (int guard = 0; guard < 24; guard++){
+        cols = (int)(W / (ch * PORT_ASPECT));
+        if (cols < 1) cols = 1;
+        if (cols > n) cols = n;
+        rows = (n + cols - 1) / cols;
+        if (rows * ch <= H || ch <= 0.11f) break;
+        ch *= 0.88f;
+    }
+    float cw = W / cols;
+    float ph = ch * 0.78f, pw = ph * PORT_ASPECT;
+    if (pw > cw * 0.90f){ pw = cw * 0.90f; ph = pw / PORT_ASPECT; }
+    float ox = (x0 + x1) * 0.5f - cols * cw * 0.5f;
+    float top = base + PORT_TOP;
+    if (rows * ch < H) top = base + PORT_BOT + rows * ch;   /* hang off the band */
+    for (int i = 0; i < n; i++){
+        Port *p = &d->ports[i];
+        int c = i % cols, r = i / cols;
+        p->x = ox + (c + 0.5f) * cw;
+        p->y = top - (r + 0.5f) * ch;          /* first row highest */
+        p->z = zf - dir * 0.06f;
+        p->hw = pw * 0.5f; p->hh = ph * 0.5f;
+    }
+}
+
+void code_layout(Disasm *d, const Building *b, float x0, float x1,
+                 float zn, float zf, float base){
+    if (!d || !d->n || d->laid) return;
+    layout_code(d, b, x0, x1, zn, zf, base);
+    layout_ports(d, x0, x1, zn, zf, base);
+    d->laid = 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* chamber alcoves                                                     */
 /* ------------------------------------------------------------------ */
 

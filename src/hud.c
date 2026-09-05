@@ -94,6 +94,7 @@ static const char *HELP[] = {
     "ENTER A TOWER   walk in the lit door on its west face",
     "CHANGE FLOOR    climb the spiral stair, or  [  and  ]",
     "INSPECT ROOM    Tab  (full detail for the room you are standing in)",
+    "FOLLOW A CALL   look at a port on a code room's far wall, then E or click",
     "FOLLOW A LINK   E at a dependency portal on the plaza",
     "OPEN A FILE     F  (browse /usr/bin, /usr/lib, ...)   Enter to load",
     "MINIMAP  M      WIREFRAME  G      FREE-FLY  V      PLAZA  R",
@@ -112,9 +113,12 @@ static const char *HELP[] = {
     "  every sculpture is one machine instruction; its height is its length",
     "  spire = jump   beacon = call   drum = ret   tiers = vector   slab = padding",
     "  cyan wire = a branch forward     orange wire = a branch back, i.e. a loop",
-    "  magenta wire = a call within the room    yellow wire = a branch that leaves",
+    "  magenta wire = a call within the room    green wire = on to the next alcove",
+    "  yellow wire = a branch that leaves, running out to its own port on the far wall",
+    "  one port per destination: look at it and press E, or click, to be taken there",
     "  the pulse running along a wire shows which way control flows",
-    "  walk up to a sculpture to read the instruction; Tab lists its neighbours",
+    "  walk up to a sculpture: it is ringed, and the readout below spells it out",
+    "  Tab lists its neighbours with their addresses and classes",
     NULL
 };
 
@@ -135,7 +139,7 @@ void hud_draw(App *a){
     }
 
     /* top-left: the file */
-    panel(10, 10, 470, 76, 0.03f, 0.05f, 0.07f, 0.66f);
+    panel(10, 10, 470, a->stallMs > 100.0f ? 94 : 76, 0.03f, 0.05f, 0.07f, 0.66f);
     glColor4f(1.0f, 0.92f, 0.62f, 1);
     text_2d(FNT_SIGN, 20, 15, 24, e->base);
     char t[320];
@@ -149,6 +153,14 @@ void hud_draw(App *a){
              e->stripped ? "stripped" : "with symtab", a->fps);
     glColor4f(0.62f, 0.68f, 0.74f, 1);
     text_2d(FNT_MONO, 20, 62, 14, t);
+    /* a frame this program drew but did not get to show: that is the
+       compositor or the driver, and it is worth knowing it happened */
+    if (a->stallMs > 100.0f){
+        snprintf(t, sizeof t, "worst frame handover %.0f ms   (swap %.1f ms now)",
+                 a->stallMs, a->swapMs);
+        glColor4f(0.98f, 0.62f, 0.45f, 1);
+        text_2d(FNT_MONO, 20, 80, 14, t);
+    }
 
     /* bottom-left: where you are */
     float by = h - 96.0f;
@@ -163,14 +175,16 @@ void hud_draw(App *a){
             Room *r = &b->rooms[p->room];
             glColor4f(0.98f, 0.98f, 0.98f, 1);
             text_2d(FNT_MONO, 20, by + 30, 20, r->title);
-            if (r->dis){
-                snprintf(t, sizeof t, "%d instructions  %d branches inside  %d leaving%s",
-                         r->dis->n, r->dis->nlinks, r->dis->nexits,
-                         r->dis->truncated ? "  (room is deeper than shown)" : "");
+            Disasm *rd = room_dis(r);
+            if (rd){
+                snprintf(t, sizeof t, "%d instructions  %d branches inside  %d exits by %d port%s%s",
+                         rd->n, rd->nlinks, rd->nexits, rd->nports,
+                         rd->nports == 1 ? "" : "s",
+                         rd->truncated ? "  (room is deeper than shown)" : "");
                 glColor4f(0.70f, 0.85f, 0.75f, 1);
                 text_2d(FNT_MONO, 20, by + 54, 15, t);
-                if (a->nearIns >= 0 && a->nearIns < r->dis->n){
-                    Insn *in = &r->dis->ins[a->nearIns];
+                if (a->nearIns >= 0 && a->nearIns < rd->n){
+                    Insn *in = &rd->ins[a->nearIns];
                     snprintf(t, sizeof t, "0x%llx   %s %s",
                              (unsigned long long)in->addr, in->mnem, in->ops);
                     float aw = text_aspect(FNT_MONO, t) * 20.0f;
@@ -254,13 +268,14 @@ void hud_draw(App *a){
                  r->linkNext >= 0 ? ", east neighbour" : "");
         glColor4f(0.82f, 0.86f, 0.90f, 1);
         for (int i = 0; i < n; i++) text_2d(FNT_MONO, px + 16, py + 72 + i * 20, 15, ln[i]);
-        if (r->dis && r->dis->n){
-            Insn *ins = r->dis->ins;
+        Disasm *rd = room_dis(r);
+        if (rd && rd->n){
+            Insn *ins = rd->ins;
             int c = a->nearIns >= 0 ? a->nearIns : 0;
             int first = c - 3; if (first < 0) first = 0;
-            if (first > r->dis->n - 7) first = r->dis->n - 7;
+            if (first > rd->n - 7) first = rd->n - 7;
             if (first < 0) first = 0;
-            for (int i = 0; i < 7 && first + i < r->dis->n; i++){
+            for (int i = 0; i < 7 && first + i < rd->n; i++){
                 Insn *in = &ins[first + i];
                 char ln2[220];
                 snprintf(ln2, sizeof ln2, "%c 0x%08llx  %-8s %-30.30s  %s",

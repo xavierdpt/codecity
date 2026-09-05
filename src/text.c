@@ -10,21 +10,31 @@
 
 #define CACHE_BITS 12
 #define CACHE_SZ   (1 << CACHE_BITS)
-#define MAX_LIVE   1400
+#define MAX_LIVE   2000
+/* The count is not the budget that matters: a 190-character listing line at
+   30 px is nearly half a megabyte of texture, so a cache bounded only by
+   entries can hold a quarter of a gigabyte of them.  Bound the pixels too,
+   and cap what one string may cost.                                      */
+#define MAX_BYTES  (28u * 1024u * 1024u)
+#define MAX_TEX_W  1280
 
 typedef struct Entry {
     char   *key;
     int     font;
     GLuint  tex;
     int     w, h;
-    unsigned stamp;
-    struct Entry *next;
+    unsigned frame;             /* the frame that last asked for it */
+    struct Entry *next;         /* hash chain    */
+    struct Entry *lru, *mru;    /* recency chain */
 } Entry;
 
 static TTF_Font *g_font[FNT_COUNT];
+static TTF_Font *g_small[FNT_COUNT];    /* for strings too long to raster whole */
 static Entry    *g_tab[CACHE_SZ];
+static Entry    *g_new, *g_old;         /* most / least recently used */
 static int       g_live;
-static unsigned  g_stamp;
+static size_t    g_bytes;
+static unsigned  g_frame = 1;
 static float     g_right[3] = {1,0,0}, g_up[3] = {0,1,0};
 
 static const struct { const char *path; int size; } FONTS[FNT_COUNT] = {
@@ -46,9 +56,17 @@ int text_init(void){
             g_font[i] = TTF_OpenFont(FALLBACK[k], FONTS[i].size);
         if (!g_font[i]){ fprintf(stderr, "no usable font for slot %d\n", i); return 0; }
         TTF_SetFontHinting(g_font[i], TTF_HINTING_LIGHT);
+        /* the same face at half the point size: a long line rasterized here
+           is a quarter of the texture, and it is only ever drawn small */
+        g_small[i] = TTF_OpenFont(FONTS[i].path, FONTS[i].size / 2);
+        for (int k = 0; !g_small[i] && FALLBACK[k]; k++)
+            g_small[i] = TTF_OpenFont(FALLBACK[k], FONTS[i].size / 2);
+        if (g_small[i]) TTF_SetFontHinting(g_small[i], TTF_HINTING_LIGHT);
     }
     return 1;
 }
+
+void text_frame(void){ g_frame++; }
 
 static unsigned hashs(const char *s, int f){
     unsigned h = 2166136261u ^ (unsigned)f;
@@ -56,28 +74,81 @@ static unsigned hashs(const char *s, int f){
     return h & (CACHE_SZ - 1);
 }
 
+/* recency list: g_new is the most recent, g_old the least */
+static void lru_unlink(Entry *e){
+    if (e->mru) e->mru->lru = e->lru; else g_new = e->lru;
+    if (e->lru) e->lru->mru = e->mru; else g_old = e->mru;
+    e->mru = e->lru = NULL;
+}
+
+static void lru_front(Entry *e){
+    e->mru = NULL; e->lru = g_new;
+    if (g_new) g_new->mru = e;
+    g_new = e;
+    if (!g_old) g_old = e;
+}
+
+static void touch(Entry *e){
+    e->frame = g_frame;
+    if (g_new != e){ lru_unlink(e); lru_front(e); }
+}
+
+static void drop(Entry *e){
+    unsigned h = hashs(e->key, e->font);
+    for (Entry **pp = &g_tab[h]; *pp; pp = &(*pp)->next)
+        if (*pp == e){ *pp = e->next; break; }
+    lru_unlink(e);
+    glDeleteTextures(1, &e->tex);
+    g_bytes -= (size_t)e->w * e->h * 4;
+    g_live--;
+    free(e->key); free(e);
+}
+
+/* Evict from the cold end until we are inside both budgets, but never touch
+   anything this frame has already drawn -- that is the difference between a
+   cache and a treadmill of rasterizing the same strings every frame.     */
 static void cache_sweep(void){
-    if (g_live <= MAX_LIVE) return;
-    unsigned cut = g_stamp - MAX_LIVE / 2;
-    for (int i = 0; i < CACHE_SZ; i++){
-        Entry **pp = &g_tab[i];
-        while (*pp){
-            Entry *e = *pp;
-            if ((int)(e->stamp - cut) < 0){
-                *pp = e->next; glDeleteTextures(1, &e->tex); free(e->key); free(e); g_live--;
-            } else pp = &e->next;
-        }
+    Entry *e = g_old;
+    while (e && (g_live > MAX_LIVE || g_bytes > MAX_BYTES)){
+        Entry *prev = e->mru;
+        if (e->frame != g_frame) drop(e);
+        e = prev;
     }
+}
+
+/* Rasterize, stepping down to the half-size face and then clipping the tail
+   rather than ever producing a texture wider than MAX_TEX_W.            */
+static SDL_Surface *raster(int font, const char *s){
+    SDL_Color white = { 255, 255, 255, 255 };
+    const char *txt = s[0] ? s : " ";
+    SDL_Surface *sf = TTF_RenderUTF8_Blended(g_font[font], txt, white);
+    if (sf && sf->w > MAX_TEX_W && g_small[font]){
+        SDL_FreeSurface(sf);
+        sf = TTF_RenderUTF8_Blended(g_small[font], txt, white);
+    }
+    /* still too wide -- a proportional face, so clip and check again */
+    TTF_Font *f = g_small[font] ? g_small[font] : g_font[font];
+    size_t keep = strlen(txt);
+    for (int guard = 0; sf && sf->w > MAX_TEX_W && guard < 4; guard++){
+        keep = (size_t)((double)keep * MAX_TEX_W / sf->w * 0.98);
+        if (keep < 4) keep = 4;
+        while (keep > 4 && ((unsigned char)txt[keep] & 0xc0) == 0x80) keep--;  /* whole UTF-8 */
+        char *cut = malloc(keep + 1);
+        memcpy(cut, txt, keep); cut[keep] = 0;
+        SDL_FreeSurface(sf);
+        sf = TTF_RenderUTF8_Blended(f, cut, white);
+        free(cut);
+    }
+    return sf;
 }
 
 static Entry *get(int font, const char *s){
     if (font < 0 || font >= FNT_COUNT) font = 0;
     unsigned h = hashs(s, font);
     for (Entry *e = g_tab[h]; e; e = e->next)
-        if (e->font == font && !strcmp(e->key, s)){ e->stamp = ++g_stamp; return e; }
+        if (e->font == font && !strcmp(e->key, s)){ touch(e); return e; }
 
-    SDL_Color white = { 255, 255, 255, 255 };
-    SDL_Surface *sf = TTF_RenderUTF8_Blended(g_font[font], s[0] ? s : " ", white);
+    SDL_Surface *sf = raster(font, s);
     if (!sf) return NULL;
     SDL_Surface *cv = SDL_ConvertSurfaceFormat(sf, SDL_PIXELFORMAT_ABGR8888, 0);
     SDL_FreeSurface(sf);
@@ -96,8 +167,9 @@ static Entry *get(int font, const char *s){
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     SDL_FreeSurface(cv);
-    e->stamp = ++g_stamp;
-    e->next = g_tab[h]; g_tab[h] = e; g_live++;
+    e->next = g_tab[h]; g_tab[h] = e;
+    g_live++; g_bytes += (size_t)e->w * e->h * 4;
+    lru_front(e); e->frame = g_frame;
     cache_sweep();
     return e;
 }
@@ -176,6 +248,11 @@ void text_shutdown(void){
         while (e){ Entry *n = e->next; glDeleteTextures(1, &e->tex); free(e->key); free(e); e = n; }
         g_tab[i] = NULL;
     }
-    for (int i = 0; i < FNT_COUNT; i++) if (g_font[i]) TTF_CloseFont(g_font[i]);
+    g_new = g_old = NULL; g_live = 0; g_bytes = 0;
+    for (int i = 0; i < FNT_COUNT; i++){
+        if (g_font[i]) TTF_CloseFont(g_font[i]);
+        if (g_small[i]) TTF_CloseFont(g_small[i]);
+        g_font[i] = g_small[i] = NULL;
+    }
     TTF_Quit();
 }

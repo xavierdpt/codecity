@@ -12,6 +12,12 @@ void emit_shell(const Building *b, BoxSink f, void *ud);
 void emit_floor(const Building *b, int fl, BoxSink f, void *ud);
 void emit_ceiling(const Building *b, int fl, BoxSink f, void *ud);
 
+/* Where a decoded room's furniture stands: the sculpture ribbon on the
+   floor and the ports on the far wall.  Shared, because the renderer draws
+   them and the click handler has to hit them.  Idempotent once laid.    */
+void code_layout(Disasm *d, const Building *b,
+                 float x0, float x1, float zn, float zf, float base);
+
 /* chamber alcoves: the 3x3 grid, less the middle and the doorway.  Shared
    so the renderer and the walk-in logic agree on where a unit lives.     */
 int  room_cell_rect(const Building *b, const Room *r, int u,

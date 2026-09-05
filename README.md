@@ -97,16 +97,39 @@ each so you can see which way control flows:
 - **cyan** — a branch forward
 - **orange** — a branch backwards, which is to say a loop
 - **magenta** — a call landing inside the same room
-- **yellow** — a branch that leaves the room, running to a terminal over the
-  doorway labelled with the symbol it lands in (`call malloc`) or the raw address
+- **green** — a call into a neighbouring alcove of the same chamber; still the
+  same room, so it wires straight to the sculpture rather than out through a port
+- **yellow** — a branch that leaves the room, running out to its own **port**
 
-Walk up to a sculpture and it is ringed and named, with the full instruction in
-the readout at the bottom of the screen. `Tab` lists its neighbours with their
-addresses and classes.
+### Ports
+
+Every distinct destination the room's code leaves for gets one port: a lit
+signboard on the far wall, named for the symbol it lands in (`malloc`,
+`_IO_puts+18`) or the raw address, coloured by the kind of transfer that reaches
+it. They are ranked across the wall in the clear band above the sculptures, so
+the ways out of a function are legible from the doorway, and every yellow wire
+in the room ends at the one port for its own destination.
+
+Look at a port and it lights up; press `E` or click and you are taken to the
+room that holds that address — another function in this tower, a stub in `.plt`,
+an alcove of a chamber three floors up. That is the shortest path there is from
+`call foo` to standing inside `foo`.
+
+Walk up to a sculpture and it is ringed, with its address and the full
+instruction — operands and all — in the readout at the bottom of the screen.
+The ring is the only thing drawn in the world for it: a label floating in the
+room can hold a mnemonic and nothing more, and the readout has room for the
+whole line. `Tab` lists its neighbours with their addresses and classes.
+
+The control-flow mnemonics (`call`, `jne`, `ret`) are billboarded over their own
+sculptures, but only for the dozen nearest — they are signposts for where you
+already are, not an overlay on the whole room.
 
 **The decoding lives only while you are in the room.** Crossing the threshold
 decodes it; stepping back out frees it. At most one room's worth of instructions
-is ever allocated, which `--selftest` asserts.
+is ever allocated, which `--selftest` asserts. A chamber counts as one room: all
+seven of its alcoves are decoded together, so the whole room is lit the moment
+you step in rather than one sculpture at a time as you walk between them.
 
 ## Controls
 
@@ -117,7 +140,7 @@ is ever allocated, which `--selftest` asserts.
 | — | walk into the lit door on a tower's west face to go in |
 | spiral stair | climbs every floor; `[` and `]` jump a floor |
 | `Tab` | detail sheet for the room — the instructions around you, or a hex dump |
-| `E` | travel through a dependency gateway |
+| `E` or click | step through the port you are looking at, or travel through a dependency gateway |
 | `F` | file browser — arrows, type to filter, `Enter` to open, `Backspace` to edit |
 | `M` `G` `V` `R` | minimap, wireframe, free-fly, back to the plaza |
 | `F1` | controls and legend |
@@ -132,7 +155,7 @@ is ever allocated, which `--selftest` asserts.
 | `src/city.c` | the mapping above — rooms, floors, tower proportions, district and city packing, lazily decoded table text, and the enter/leave lifecycle of a code room |
 | `src/world.c` | wall and slab geometry, the spiral-stair height field, collision, player physics |
 | `src/render.c` | the drawing — exteriors baked into display lists, interiors drawn per floor |
-| `src/text.c` | strings rendered by SDL2_ttf into cached GL textures, for signs, plates and the HUD |
+| `src/text.c` | strings rendered by SDL2_ttf into cached GL textures, for signs, plates and the HUD; the cache is bounded in bytes as well as entries, and never evicts a string the frame in progress has already drawn |
 | `src/hud.c` | readouts, minimap, detail sheet, help, file browser |
 | `src/main.c` | window, event loop, file loading, and the three headless modes |
 
@@ -141,10 +164,12 @@ is ever allocated, which `--selftest` asserts.
 ```sh
 ./codecity FILE --selftest   # walks in the front door, up the spiral to floor 3, back
                             # down one, along the corridor and through a room door, for
-                            # the first 8 towers; also asserts that entering a room
-                            # allocates exactly one decoding and leaving frees it.
+                            # the first 8 towers; asserts that entering a room
+                            # allocates one room's worth of decoding and leaving
+                            # frees it, and that every port in a code room can be
+                            # aimed at and leads to a room that holds its address.
                             # Non-zero exit on failure.
-./codecity FILE --shot DIR   # renders thirteen canned viewpoints to DIR/*.ppm
+./codecity FILE --shot DIR   # renders fourteen canned viewpoints to DIR/*.ppm
 ./codecity FILE --bench      # frame time in the busiest code room it can find
 ```
 
@@ -155,6 +180,77 @@ message.
 
 `--bench` in a 640-instruction room with 251 wires: ~405 fps, 2.5 ms/frame on
 Mesa/Iris Xe. The live app is vsync-capped to 60.
+
+### Focus, and the alt-tab freeze
+
+SDL picks the **x11** driver here even in a Wayland session, so the window is an
+XWayland client and `SDL_SetRelativeMouseMode(SDL_TRUE)` — mouse-look — is an
+`XGrabPointer`. The event loop used to handle only `SDL_QUIT` and resize, so the
+grab was held across a focus change: alt-tab handed the desktop to GNOME Shell
+while this window still had the pointer grabbed, which is a well-worn way to
+lock a whole session up for a few seconds, or for good.
+
+The loop now handles focus and visibility:
+
+- `FOCUS_LOST` drops relative mouse mode, so the grab is never held by a window
+  the compositor is switching away from. `FOCUS_GAINED` takes it back, and
+  swallows the first motion event so the camera does not jump by however far the
+  pointer travelled while we were away.
+- `MINIMIZED`/`HIDDEN` stops drawing altogether and waits on the event queue
+  instead. A window nobody can see gets no frame callbacks, so swapping into one
+  can block for as long as it stays hidden — a wait we cannot be woken from.
+  Measured in a nested X server: 350% CPU visible, **0% hidden**, straight back
+  to 350% on restore.
+- Unfocused but visible throttles to about 40 fps. There is nothing to animate
+  for behind another window.
+
+`SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR` is also turned off before
+`SDL_Init`. It defaults to on, which asks the compositor to unredirect the
+window; that is for fullscreen games, and it makes Mutter redirect and
+unredirect on every focus change.
+
+Every frame now times `SDL_GL_SwapWindow`. Anything over 250 ms prints
+
+```
+stall: 3180 ms inside SDL_GL_SwapWindow -- the frame was drawn, the compositor
+or driver held it
+```
+
+and the worst handover so far shows under the fps readout. That is the line that
+tells the two cases apart: a stall inside the swap is not this program's frame
+time, it is the frame being drawn and then not shown.
+
+`--gpudebug` puts `MESA_DEBUG=1` and `GALLIUM_HUD=fps,VRAM-usage` in the
+environment before SDL brings the driver up, which is the only moment Mesa
+reads them. It is for telling a stall in this program from a stall in the
+driver: if the HUD's fps keeps climbing while the window is frozen, the
+frames are being drawn and something downstream is holding them.
+
+`VRAM-usage` is a radeonsi/nouveau query — the Iris driver does not export it
+and prints `gallium_hud: unknown driver query 'VRAM-usage'`, leaving just the
+fps graph. An existing `GALLIUM_HUD` in the environment is left alone, so on
+Intel the useful form is:
+
+```sh
+GALLIUM_HUD=fps,frametime,cpu ./codecity --gpudebug FILE
+```
+
+### The glyph cache
+
+Text is the one part of a frame that can allocate, and it used to be bounded
+only by a count of 1400 entries. A 190-character listing line rasterizes to
+about half a megabyte of texture, so standing in a `.dynstr` or `.symtab` tower
+could hold a quarter of a gigabyte of GL textures and churn tens of thousands of
+`glTexImage2D`/`glDeleteTextures` calls while walking. Worse, the sweep evicted
+anything not touched in the last 700 lookups — so once a frame needed more than
+700 strings, it evicted the strings it was still drawing, and every frame
+re-rasterized hundreds of them: measured 0.7 ms/frame before that threshold and
+20.7 ms/frame after, for the same view, and it does not recover until you walk
+away. The cache now has a byte budget as well as an entry budget, evicts by true
+recency, refuses to evict anything the frame in progress has already drawn, and
+steps a very long string down to a half-size face rather than ever rasterizing a
+texture wider than 1280 texels. A listing tower's whole working set measures
+about 21 MB.
 
 ---
 

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Set the terminal window/tab title. Defaults to "codecity".
+# Usage: ./set-title.bsh [title]
+title="${1:-codecity}"
+printf '\033]0;%s\007' "$title"

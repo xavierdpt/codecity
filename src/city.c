@@ -398,11 +398,15 @@ static void realize_room(Building *b, Room *r){
    decoded at a time, and the largest function in /usr/bin is ~5000
    instructions, so this is under a megabyte of Insn.                    */
 #define MAX_INS_PER_ROOM 0
+/* ... but do cap the bytes.  The largest real function measured across
+   /usr/lib is 38 KiB; a 330 KiB "function" is a slab of data that the
+   boundary recovery guessed wrong about.                              */
+#define MAX_ROOM_BYTES (128u * 1024u)
 
 int room_is_code(const Building *b, const Room *r){
     /* A chamber is not one run of code -- it holds several unrelated units,
        and decoding r->data would disassemble the first one across the whole
-       room.  Its alcoves are entered individually, via city_enter_unit().  */
+       room.  Its alcoves are decoded one by one, by city_enter_room().    */
     return b && r && b->sec && (b->sec->flags & SHF_EXECINSTR) &&
            r->data && r->datasz > 0 &&
            r->kind != RT_EMPTY && r->kind != RT_LIST && r->kind != RT_GROUP;
@@ -423,26 +427,61 @@ void city_leave_room(City *c){
         Room *r = &g_openBld->rooms[g_openRoom];
         disasm_free(r->dis);
         r->dis = NULL;
+        for (int i = 0; i < r->nunits && r->units; i++){
+            disasm_free(r->units[i].dis);
+            r->units[i].dis = NULL;
+        }
         r->activeUnit = -1;
     }
     g_openBld = NULL; g_openRoom = -1;
 }
 
-/* decode one alcove of a chamber */
-void city_enter_unit(City *c, int bi, int ri, int ui){
-    if (bi < 0 || bi >= c->nbld) return;
-    Building *b = &c->bld[bi];
-    if (ri < 0 || ri >= b->nrooms) return;
-    Room *r = &b->rooms[ri];
-    if (ui < 0 || ui >= r->nunits || !r->units){ city_leave_room(c); return; }
-    if (g_openBld == b && g_openRoom == ri && r->activeUnit == ui) return;
-    city_leave_room(c);
-    Unit *u = &r->units[ui];
-    if (!unit_is_code(b, u)) return;
-    uint64_t n = u->datasz;
-    if (u->size && n > u->size) n = u->size;
-    r->dis = disasm_run(u->data, n, u->addr ? u->addr : u->fileoff, MAX_INS_PER_ROOM);
-    if (r->dis){ g_openBld = b; g_openRoom = ri; r->activeUnit = ui; }
+/* name the far end of every wire that leaves the room */
+static void label_ports(const Elf *e, Disasm *d){
+    if (!d) return;
+    for (int i = 0; i < d->nports; i++){
+        Port *p = &d->ports[i];
+        uint64_t off = 0;
+        const char *nm = elf_sym_at(e, p->addr, &off);
+        if (nm && nm[0] && !off) snprintf(p->label, sizeof p->label, "%s", nm);
+        else if (nm && nm[0])    snprintf(p->label, sizeof p->label, "%s+%llu", nm,
+                                          (unsigned long long)off);
+        else                     snprintf(p->label, sizeof p->label, "0x%llx",
+                                          (unsigned long long)p->addr);
+    }
+}
+
+/* A chamber's alcoves are separate decodings but one room: a call from one
+   to another has not left the room, so it wires straight to the sculpture
+   instead of earning a port.                                             */
+static void chamber_link(Room *r){
+    for (int i = 0; i < r->nunits; i++){
+        Disasm *d = r->units[i].dis;
+        if (!d) continue;
+        for (int q = 0; q < d->n; q++){
+            Insn *t = &d->ins[q];
+            if (t->target >= 0 || !t->taddr) continue;
+            for (int j = 0; j < r->nunits; j++){
+                if (j == i) continue;
+                int at = disasm_index_of(r->units[j].dis, t->taddr);
+                if (at < 0) continue;
+                t->target = at; t->tunit = j;
+                d->nlinks++; d->nexits--;
+                break;
+            }
+        }
+    }
+}
+
+static Disasm *decode(const uint8_t *data, uint64_t datasz, uint64_t size,
+                      uint64_t addr, uint64_t fileoff){
+    uint64_t n = datasz;
+    if (size && n > size) n = size;
+    /* A symbol of unrecorded size runs to the end of its section, and a run
+       of data mistaken for a function can be just as long: cap it, or one
+       step through the wrong door decodes a megabyte.                     */
+    if (n > MAX_ROOM_BYTES) n = MAX_ROOM_BYTES;
+    return disasm_run(data, n, addr ? addr : fileoff, MAX_INS_PER_ROOM);
 }
 
 void city_enter_room(City *c, int bi, int ri){
@@ -452,11 +491,70 @@ void city_enter_room(City *c, int bi, int ri){
     Building *b = &c->bld[bi];
     if (ri < 0 || ri >= b->nrooms) return;
     Room *r = &b->rooms[ri];
+
+    if (r->kind == RT_GROUP && r->units){
+        int any = 0;
+        for (int i = 0; i < r->nunits; i++){
+            Unit *u = &r->units[i];
+            if (!unit_is_code(b, u)) continue;
+            u->dis = decode(u->data, u->datasz, u->size, u->addr, u->fileoff);
+            if (u->dis) any = 1;
+        }
+        if (!any) return;
+        chamber_link(r);
+        for (int i = 0; i < r->nunits; i++){
+            disasm_ports(r->units[i].dis);
+            label_ports(b->elf, r->units[i].dis);
+        }
+        g_openBld = b; g_openRoom = ri;
+        return;
+    }
+
     if (!room_is_code(b, r)) return;
-    uint64_t n = r->datasz;
-    if (r->size && n > r->size) n = r->size;
-    r->dis = disasm_run(r->data, n, r->addr ? r->addr : r->fileoff, MAX_INS_PER_ROOM);
-    if (r->dis){ g_openBld = b; g_openRoom = ri; }
+    r->dis = decode(r->data, r->datasz, r->size, r->addr, r->fileoff);
+    if (!r->dis) return;
+    disasm_ports(r->dis);
+    label_ports(b->elf, r->dis);
+    g_openBld = b; g_openRoom = ri;
+}
+
+/* ------------------------------------------------------------------ */
+/* finding an address in the city                                      */
+/* ------------------------------------------------------------------ */
+
+int city_find_addr(const City *c, uint64_t addr, int *bi, int *ri, int *ui){
+    if (!c || !addr) return 0;
+    for (int i = 0; i < c->nbld; i++){
+        const Building *b = &c->bld[i];
+        const Sec *s = b->sec;
+        if (!s || !s->addr || addr < s->addr || addr >= s->addr + s->size) continue;
+        /* the room that starts nearest below the address; chambers are
+           checked alcove by alcove, since their own addr is only the
+           lowest of the bunch                                          */
+        int best = -1, bestu = -1;
+        uint64_t bestat = 0;
+        for (int k = 0; k < b->nrooms; k++){
+            const Room *r = &b->rooms[k];
+            if (r->kind == RT_GROUP && r->units){
+                for (int u = 0; u < r->nunits; u++){
+                    const Unit *un = &r->units[u];
+                    if (!un->addr || un->addr > addr) continue;
+                    if (un->size && addr >= un->addr + un->size) continue;
+                    if (best < 0 || un->addr > bestat){ bestat = un->addr; best = k; bestu = u; }
+                }
+                continue;
+            }
+            if (!r->addr || r->addr > addr) continue;
+            if (r->size && addr >= r->addr + r->size) continue;
+            if (best < 0 || r->addr > bestat){ bestat = r->addr; best = k; bestu = -1; }
+        }
+        if (best < 0) continue;
+        if (bi) *bi = i;
+        if (ri) *ri = best;
+        if (ui) *ui = bestu;
+        return 1;
+    }
+    return 0;
 }
 
 void floor_release(Building *b){
@@ -1067,8 +1165,10 @@ void city_free(City *c){
             Room *r = &b->rooms[k];
             for (int j = 0; j < r->nlines; j++) free(r->lines[j]);
             free(r->lines);
+            for (int j = 0; j < r->nunits && r->units; j++)
+                disasm_free(r->units[j].dis);     /* belt and braces */
             free(r->units);
-            disasm_free(r->dis); r->dis = NULL;   /* belt and braces */
+            disasm_free(r->dis); r->dis = NULL;
         }
         free(b->rooms); free(b->floorStart);
     }

@@ -1,0 +1,3 @@
+# Set the window title, then re-assert it on every prompt so nothing steals it back.
+printf '\033]0;codecity\007'
+PS1="\[\033]0;codecity\007\]\[\033[01;32m\]codecity\[\033[00m\]\$ "

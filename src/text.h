@@ -2,6 +2,9 @@
 #define TEXT_H
 enum { FNT_MONO, FNT_MONO_BIG, FNT_SIGN, FNT_COUNT };
 int  text_init(void);
+/* start of a frame: nothing drawn since this call may be evicted from the
+   glyph cache, so a heavy frame cannot make itself re-rasterize forever */
+void text_frame(void);
 void text_shutdown(void);
 /* measure: returns aspect (w/h) of the rendered string */
 float text_aspect(int font, const char *s);

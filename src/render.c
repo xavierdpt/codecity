@@ -283,51 +283,6 @@ static const float ICOL[IC_COUNT][3] = {
     { 0.30f, 0.88f, 0.92f },   /* system   */
 };
 
-static float class_lift(int c){
-    switch (c){
-    case IC_CALL:   return 0.55f;
-    case IC_JUMP:   return 0.34f;
-    case IC_CJUMP:  return 0.26f;
-    case IC_SYSCALL:return 0.62f;
-    case IC_RET:    return 0.02f;
-    case IC_NOP:    return -0.14f;
-    default:        return 0.0f;
-    }
-}
-
-/* serpentine ribbon across the room floor, so consecutive instructions touch */
-static void layout_code(Disasm *d, const Building *b, float x0, float x1,
-                        float zn, float zf, float base){
-    float dir = (zf > zn) ? 1.0f : -1.0f;
-    float usableW = x1 - x0 - 2 * TILE_MARGIN;
-    float usableD = fabsf(zf - zn) - TILE_SETBACK - TILE_MARGIN;
-    if (usableW < 1.0f) usableW = 1.0f;
-    if (usableD < 1.0f) usableD = 1.0f;
-    /* the room was sized from one tile per instruction, so start there
-       and only shrink if the real decode came out longer than estimated */
-    float pitch = b->tile;
-    int cols = 1, rows = 1;
-    for (;;){
-        cols = (int)(usableW / pitch); if (cols < 1) cols = 1;
-        rows = (int)(usableD / pitch); if (rows < 1) rows = 1;
-        if (cols * rows >= d->n || pitch <= 0.20f) break;
-        pitch *= 0.93f;
-    }
-    d->pitch = pitch; d->cols = cols; d->rows = rows;
-    float gx = x0 + TILE_MARGIN + (usableW - cols * pitch) * 0.5f;
-    for (int i = 0; i < d->n; i++){
-        Insn *t = &d->ins[i];
-        int row = i / cols, col = i % cols;
-        if (row & 1) col = cols - 1 - col;               /* boustrophedon */
-        if (row >= rows) row = rows - 1;                 /* overflow piles on the last row */
-        t->x = gx + (col + 0.5f) * pitch;
-        t->z = zn + dir * (TILE_SETBACK + (row + 0.5f) * pitch);
-        t->y = base;
-        t->h = clampf(0.22f + t->len * 0.075f + class_lift(t->cls), 0.06f, 1.55f);
-    }
-    d->laid = 1;
-}
-
 /* P(t) on the quadratic arc from a to b, lifted in the middle */
 static void arc_point(const float a[3], const float b[3], float lift, float t, float out[3]){
     float c[3] = { (a[0]+b[0])*0.5f, (a[1]+b[1])*0.5f + lift, (a[2]+b[2])*0.5f };
@@ -398,11 +353,58 @@ static void sculpture(const Insn *t, float pitch, int detail){
     }
 }
 
-static void draw_code_room(const Building *b, const Room *r, App *a,
+/* the port the crosshair is on, so it can be lit up.  Set by render_pick_port,
+   which the interaction code runs just before the frame is drawn.        */
+static const Port *g_hotPort;
+
+/* a port panel: a lit way out of the room, one per destination */
+static void draw_port(const Port *p, float nz, int hot, int near, float now){
+    float z = p->z, zf = z - nz * 0.07f;      /* the lit face, clear of its frame */
+    float w = p->hw, h = p->hh;
+    const float *c = ICOL[p->cls < IC_COUNT ? p->cls : 0];
+    /* surround */
+    glColor3f(0.34f, 0.33f, 0.31f);
+    draw_box(p->x - w - 0.07f, p->y - h - 0.07f, z - nz * 0.03f,
+             p->x + w + 0.07f, p->y + h + 0.07f, z + nz * 0.05f);
+    /* the panel itself, brighter the more traffic it carries */
+    glDisable(GL_LIGHTING);
+    float pulse = hot ? 1.0f : 0.62f + 0.10f * sinf(now * 2.1f + p->x);
+    glColor3f(clampf(c[0] * pulse + (hot ? 0.30f : 0.0f), 0, 1),
+              clampf(c[1] * pulse + (hot ? 0.30f : 0.0f), 0, 1),
+              clampf(c[2] * pulse + (hot ? 0.30f : 0.0f), 0, 1));
+    glBegin(GL_QUADS);
+    quad3(p->x - w, p->y - h, zf, p->x + w, p->y - h, zf,
+          p->x + w, p->y + h, zf, p->x - w, p->y + h, zf, 0, 0, -nz);
+    glEnd();
+    if (hot){                                  /* a ring you can see from afar */
+        glColor4f(1.0f, 0.96f, 0.55f, 0.95f);
+        glLineWidth(2.5f);
+        glBegin(GL_LINE_LOOP);
+        glVertex3f(p->x - w - 0.10f, p->y - h - 0.10f, zf - nz * 0.02f);
+        glVertex3f(p->x + w + 0.10f, p->y - h - 0.10f, zf - nz * 0.02f);
+        glVertex3f(p->x + w + 0.10f, p->y + h + 0.10f, zf - nz * 0.02f);
+        glVertex3f(p->x - w - 0.10f, p->y + h + 0.10f, zf - nz * 0.02f);
+        glEnd();
+        glLineWidth(1.0f);
+    }
+    if (near || hot){
+        glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND);
+        glColor3f(0.06f, 0.06f, 0.07f);
+        float ah = text_aspect(FNT_MONO, p->label);
+        float th = w * 1.80f / (ah > 0.01f ? ah : 1.0f);
+        if (th > h * 0.70f) th = h * 0.70f;
+        wall_text(FNT_MONO, p->x, p->y - th * 0.5f, zf - nz * 0.01f, -nz, th, 1, p->label);
+        glDisable(GL_TEXTURE_2D);
+    }
+    glEnable(GL_LIGHTING);
+}
+
+/* One decoding, laid out and drawn: a plain room's own, or one alcove of a
+   chamber.  myunit is that alcove, or -1 when the room is its own unit.  */
+static void draw_code_room(const Building *b, const Room *r, App *a, Disasm *d, int myunit,
                            float x0, float x1, float zn, float zf, float nz, float base){
-    Disasm *d = r->dis;
     if (!d || !d->n) return;
-    if (!d->laid) layout_code(d, b, x0, x1, zn, zf, base);
+    code_layout(d, b, x0, x1, zn, zf, base);
 
     float px = a->p.x, py = a->p.y, pz = a->p.z;
     float now = a->now;
@@ -430,13 +432,20 @@ static void draw_code_room(const Building *b, const Room *r, App *a,
     for (int i = 0; i < d->n; i++) glVertex3f(d->ins[i].x, base + 0.075f, d->ins[i].z);
     glEnd();
 
-    /* branches that land inside the room: a wire from one sculpture to another */
+    /* branches that land inside the room -- including in a neighbouring
+       alcove of the same chamber -- run straight to the sculpture */
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glLineWidth(2.0f);
     for (int i = 0; i < d->n; i++){
         const Insn *t = &d->ins[i];
         if (t->target < 0) continue;
-        const Insn *u = &d->ins[t->target];
+        const Disasm *od = d;
+        if (t->tunit >= 0){
+            if (!r->units || t->tunit >= r->nunits) continue;
+            od = r->units[t->tunit].dis;
+            if (!od || !od->laid || t->target >= od->n) continue;
+        }
+        const Insn *u = &od->ins[t->target];
         float dx = t->x - px, dz = t->z - pz;
         if (dx*dx + dz*dz > 1000.0f) continue;
         float A[3] = { t->x, t->y + t->h + 0.06f, t->z };
@@ -444,83 +453,76 @@ static void draw_code_room(const Building *b, const Room *r, App *a,
         float len = fabsf(A[0]-B[0]) + fabsf(A[2]-B[2]);
         float lift = clampf(0.45f + len * 0.14f, 0.35f, 2.4f);
         if (t->cls == IC_CALL)          glColor4f(0.95f, 0.45f, 0.85f, 0.92f);
+        else if (t->tunit >= 0)         glColor4f(0.60f, 0.95f, 0.70f, 0.85f);   /* next alcove */
         else if (t->target > i)         glColor4f(0.35f, 0.88f, 0.98f, 0.85f);   /* onward */
         else                            glColor4f(1.00f, 0.58f, 0.22f, 0.92f);   /* a loop */
         draw_arc(A, B, lift, now, (float)i * 0.137f);
     }
 
-    /* branches that leave the room: a wire out to the lintel over the door */
-    int labelled = 0;
-    float doorx = (x0 + x1) * 0.5f;
-    float doorz = zn + (nz > 0 ? -1.05f : 1.05f);
-    float B[3] = { doorx, base + 2.45f, doorz };
-    for (int i = 0; i < d->n && labelled < 12; i++){
+    /* branches that leave the room: each one wires to the port of its own
+       destination, so the wall reads as a switchboard of exits */
+    int wired = 0;
+    for (int i = 0; i < d->n && wired < 64; i++){
         const Insn *t = &d->ins[i];
-        if (t->target >= 0 || !t->taddr) continue;
+        if (t->port < 0 || t->port >= d->nports) continue;
+        const Port *p = &d->ports[t->port];
         float dx = t->x - px, dz = t->z - pz;
-        if (dx*dx + dz*dz > 150.0f) continue;
-        labelled++;
+        if (dx*dx + dz*dz > 400.0f) continue;
+        wired++;
         float A[3] = { t->x, t->y + t->h + 0.06f, t->z };
-        glColor4f(0.90f, 0.88f, 0.42f, 0.62f);
+        float B[3] = { p->x, p->y, p->z - nz * 0.14f };
+        int hot = (g_hotPort == p);
+        if (hot) glColor4f(1.00f, 0.95f, 0.50f, 0.95f);
+        else     glColor4f(0.90f, 0.88f, 0.42f, 0.55f);
         draw_arc(A, B, 0.55f, now, (float)i * 0.211f);
     }
     glLineWidth(1.0f);
-    if (labelled){                       /* the terminal the wires run to */
-        glColor4f(0.62f, 0.60f, 0.30f, 1.0f);
-        draw_box(B[0]-0.22f, B[1]-0.10f, B[2]-0.10f, B[0]+0.22f, B[1]+0.10f, B[2]+0.10f);
-    }
+    glEnable(GL_LIGHTING);
 
-    /* what the outgoing wires point at */
-    if (labelled){
-        glEnable(GL_TEXTURE_2D);
-        int shown = 0;
-        for (int i = 0; i < d->n && shown < 6; i++){
-            const Insn *t = &d->ins[i];
-            if (t->target >= 0 || !t->taddr) continue;
-            float dx = t->x - px, dz = t->z - pz;
-            if (dx*dx + dz*dz > 90.0f) continue;
-            uint64_t off = 0;
-            const char *nm = elf_sym_at(b->elf, t->taddr, &off);
-            char lab[160];
-            if (nm && nm[0]){
-                if (off) snprintf(lab, sizeof lab, "%s %s+%llu", t->mnem, nm, (unsigned long long)off);
-                else     snprintf(lab, sizeof lab, "%s %s", t->mnem, nm);
-            } else snprintf(lab, sizeof lab, "%s 0x%llx", t->mnem, (unsigned long long)t->taddr);
-            glColor3f(0.98f, 0.96f, 0.62f);
-            text_billboard(FNT_MONO, doorx, base + 2.72f + shown * 0.24f, doorz + (nz > 0 ? 0.30f : -0.30f),
-                           0.21f, lab);
-            shown++;
+    /* the ports themselves */
+    {
+        float mid = (x0 + x1) * 0.5f;
+        float d2 = (px - mid) * (px - mid) + (pz - zf) * (pz - zf);
+        for (int i = 0; i < d->nports; i++){
+            const Port *p = &d->ports[i];
+            draw_port(p, nz, g_hotPort == p, d2 < 22.0f * 22.0f && p->hh > 0.11f, now);
         }
-        glDisable(GL_TEXTURE_2D);
     }
 
-    /* label the control flow -- those are the signposts; plus whatever you
-       are standing next to, whatever it is */
+    /* The sculpture you are standing at is ringed, and nothing more: its
+       instruction, operands and all, is already spelled out in the readout
+       at the foot of the screen, where there is room to read it.         */
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    int mine = (myunit < 0) ? (r->kind != RT_GROUP) : (myunit == r->activeUnit);
+    if (mine && a->nearIns >= 0 && a->nearIns < d->n){
+        const Insn *t = &d->ins[a->nearIns];
+        glColor4f(1.0f, 0.90f, 0.35f, 0.9f);
+        glLineWidth(2.0f);
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < 20; k++){
+            float ang = k / 20.0f * 6.2831853f;
+            glVertex3f(t->x + cosf(ang) * 0.34f, t->y + 0.10f, t->z + sinf(ang) * 0.34f);
+        }
+        glEnd();
+        glLineWidth(1.0f);
+    }
+
+    /* the control-flow mnemonics, near enough to actually be read.  Text is
+       blended: without GL_BLEND the glyph alpha is ignored and every label
+       is a solid rectangle of whatever colour is current.                */
     glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     int nlab = 0;
-    for (int i = 0; i < d->n && nlab < 30; i++){
+    for (int i = 0; i < d->n && nlab < 12; i++){
         const Insn *t = &d->ins[i];
-        int hot = (i == a->nearIns);
-        int flow = (t->cls == IC_JUMP || t->cls == IC_CJUMP || t->cls == IC_CALL ||
-                    t->cls == IC_RET  || t->cls == IC_SYSCALL);
-        if (!hot && !flow) continue;
+        if (t->cls != IC_JUMP && t->cls != IC_CJUMP && t->cls != IC_CALL &&
+            t->cls != IC_RET  && t->cls != IC_SYSCALL) continue;
         float dx = t->x - px, dz = t->z - pz;
-        float dd = dx*dx + dz*dz;
-        if (!hot && dd > 64.0f) continue;
+        if (dx*dx + dz*dz > 20.0f) continue;
         nlab++;
-        glColor3f(hot ? 1.0f : 0.92f, hot ? 0.95f : 0.93f, hot ? 0.45f : 0.88f);
-        text_billboard(FNT_MONO, t->x, t->y + t->h + 0.17f, t->z, hot ? 0.19f : 0.105f, t->mnem);
-        if (hot){                        /* a ring round the one you can read */
-            glDisable(GL_TEXTURE_2D);
-            glColor4f(1.0f, 0.90f, 0.35f, 0.85f);
-            glBegin(GL_LINE_LOOP);
-            for (int k = 0; k < 20; k++){
-                float ang = k / 20.0f * 6.2831853f;
-                glVertex3f(t->x + cosf(ang) * 0.34f, t->y + 0.10f, t->z + sinf(ang) * 0.34f);
-            }
-            glEnd();
-            glEnable(GL_TEXTURE_2D);
-        }
+        glColor4f(0.94f, 0.94f, 0.88f, 0.85f);
+        text_billboard(FNT_MONO, t->x, t->y + t->h + 0.17f, t->z, 0.115f, t->mnem);
     }
     glDisable(GL_TEXTURE_2D);
     (void)py;
@@ -606,7 +608,7 @@ static void draw_tiles(const Building *b, const Room *r, App *ap,
                       u == r->activeUnit ? 0.29f : 0.21f,
                       u == r->activeUnit ? 0.33f : 0.24f);
             draw_box(cx0, base + 0.04f, cz0, cx1 - 0.06f, base + 0.07f, cz1 - 0.06f);
-            if (u == r->activeUnit && r->dis) continue;   /* sculptures instead */
+            if (un->dis) continue;                        /* sculptures instead */
             draw_grid(RT_FUNC, un->data, un->datasz, un->size ? un->size : un->datasz,
                       un->tw, un->th, cx0, cz0, pitch, base + 0.07f, maxh);
         }
@@ -673,17 +675,29 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
     if (dist > 46.0f) return;              /* too far to bother with contents */
 
     if (r->dis && r->kind != RT_GROUP){     /* decoded because we are standing in it */
-        draw_code_room(b, r, a, x0, x1, zn, zf, nz, base);
+        draw_code_room(b, r, a, r->dis, -1, x0, x1, zn, zf, nz, base);
         return;
     }
 
     switch (r->kind){
     case RT_FUNC: case RT_OBJECT: case RT_BYTES: case RT_GROUP:
         draw_tiles(b, r, a, x0, x1, zn, zf, base);
-        if (r->kind == RT_GROUP && r->dis && r->activeUnit >= 0){
-            float cx0, cz0, cx1, cz1;
-            if (room_cell_rect(b, r, r->activeUnit, &cx0, &cz0, &cx1, &cz1))
-                draw_code_room(b, r, a, cx0, cx1, cz0, cz1, 1.0f, base + 0.07f);
+        if (r->kind == RT_GROUP && r->units){
+            /* Lay every alcove out first: a wire from one to another needs
+               the far sculpture to already know where it stands.          */
+            for (int u = 0; u < r->nunits && u < 7; u++){
+                float cx0, cz0, cx1, cz1;
+                if (!r->units[u].dis) continue;
+                if (room_cell_rect(b, r, u, &cx0, &cz0, &cx1, &cz1))
+                    code_layout(r->units[u].dis, b, cx0, cx1, cz0, cz1, base + 0.07f);
+            }
+            for (int u = 0; u < r->nunits && u < 7; u++){
+                float cx0, cz0, cx1, cz1;
+                if (!r->units[u].dis) continue;
+                if (room_cell_rect(b, r, u, &cx0, &cz0, &cx1, &cz1))
+                    draw_code_room(b, r, a, r->units[u].dis, u,
+                                   cx0, cx1, cz0, cz1, 1.0f, base + 0.07f);
+            }
         }
         if (r->kind == RT_GROUP && r->units){    /* a plaque over each alcove */
             glDisable(GL_LIGHTING); glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND);
@@ -720,7 +734,7 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
         float bh = lh * 1.28f * shown + 0.34f;
         float bx0 = mid - bw * 0.5f, bx1 = mid + bw * 0.5f;
         float ytop = base + clampf(0.9f + bh, 1.6f, 3.35f);
-        float z = zf + nz * 0.02f;
+        float z = zf - nz * 0.02f;          /* just inside the room, not in the wall */
         glDisable(GL_LIGHTING);
         glColor3f(0.11f, 0.12f, 0.14f);
         glBegin(GL_QUADS);
@@ -730,12 +744,12 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
         draw_box(bx0 - 0.08f, ytop - bh - 0.08f, z - 0.05f * nz, bx1 + 0.08f, ytop - bh, z + 0.05f * nz);
         draw_box(bx0 - 0.08f, ytop, z - 0.05f * nz, bx1 + 0.08f, ytop + 0.08f, z + 0.05f * nz);
         glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND);
-        float rv[3] = { nz > 0 ? 1.0f : -1.0f, 0, 0 };
+        float rv[3] = { nz > 0 ? -1.0f : 1.0f, 0, 0 };
         float uv[3] = { 0, 1, 0 };
         float y = ytop - 0.17f - lh;
         for (int i = 0; i < shown; i++){
             glColor3f(0.62f, 0.92f, 0.68f);
-            float p[3] = { nz > 0 ? bx0 + 0.15f : bx1 - 0.15f, y, z + nz * 0.012f };
+            float p[3] = { nz > 0 ? bx1 - 0.15f : bx0 + 0.15f, y, z - nz * 0.012f };
             text_3d(FNT_MONO, p, rv, uv, lh, 0, r->lines[i]);
             y -= lh * 1.28f;
         }
@@ -758,6 +772,54 @@ static void draw_room(const Building *b, const Room *r, int highlight, App *a){
         glEnable(GL_LIGHTING);
         break; }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* picking a port down the crosshair                                   */
+/* ------------------------------------------------------------------ */
+
+/* the panels all face -Z, so one plane test each is enough */
+static float port_hit(const Port *p, const float o[3], const float dv[3]){
+    float planez = p->z - 0.07f;
+    if (fabsf(dv[2]) < 1e-5f) return -1.0f;
+    float t = (planez - o[2]) / dv[2];
+    if (t < 0.20f || t > 70.0f) return -1.0f;
+    float hx = o[0] + dv[0] * t, hy = o[1] + dv[1] * t;
+    float m = 0.06f;                          /* a little slack, panels are small */
+    if (hx < p->x - p->hw - m || hx > p->x + p->hw + m) return -1.0f;
+    if (hy < p->y - p->hh - m || hy > p->y + p->hh + m) return -1.0f;
+    return t;
+}
+
+int render_pick_port(App *a, uint64_t *addr, const char **label){
+    g_hotPort = NULL;
+    City *c = a->city;
+    const Player *p = &a->p;
+    if (!c || p->inside < 0 || p->room < 0) return 0;
+    Building *b = &c->bld[p->inside];
+    if (p->room >= b->nrooms) return 0;
+    Room *r = &b->rooms[p->room];
+
+    float o[3] = { p->x, p->y + EYE_H, p->z };
+    float dv[3] = { cosf(p->yaw) * cosf(p->pitch), sinf(p->pitch),
+                    sinf(p->yaw) * cosf(p->pitch) };
+    float best = 1e9f;
+    const Port *hit = NULL;
+    for (int u = -1; u < r->nunits; u++){
+        Disasm *d = (u < 0) ? r->dis : (r->units ? r->units[u].dis : NULL);
+        if (u < 0 && r->kind == RT_GROUP) continue;
+        if (!d || !d->laid) continue;
+        for (int i = 0; i < d->nports; i++){
+            float t = port_hit(&d->ports[i], o, dv);
+            if (t > 0 && t < best){ best = t; hit = &d->ports[i]; }
+        }
+        if (r->kind != RT_GROUP) break;
+    }
+    if (!hit) return 0;
+    g_hotPort = hit;
+    if (addr) *addr = hit->addr;
+    if (label) *label = hit->label;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -910,6 +972,7 @@ void render_scene(App *a){
     Player *p = &a->p;
     int w = a->winw, h = a->winh;
 
+    text_frame();
     glViewport(0, 0, w, h);
     glClear(GL_DEPTH_BUFFER_BIT);
     draw_sky();

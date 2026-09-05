@@ -118,6 +118,12 @@ const char *elf_reltype_name(int machine, uint32_t t);
 #define PLATE_FILL  0.62f   /* assumed packing efficiency when sizing a plate */
 #define GROUP_TILES 64      /* units at or below this share a chamber       */
 #define GROUND_MARGIN 400.0f/* how far the ground quad runs past the city   */
+#define PORT_BOT    1.70f   /* the band of far wall the exit ports occupy --
+                               above the tallest sculpture, so the way out is
+                               in sight from anywhere in the room            */
+#define PORT_TOP    3.30f
+#define PORT_ASPECT 1.55f   /* a port panel is wider than it is tall        */
+#define PORT_H_MAX  0.46f   /* ... and never grows past a signboard         */
 
 /* one piece of content: a function, an object, a slice of a table.  A plain
    room holds exactly one and mirrors it in its own fields; a chamber holds
@@ -130,6 +136,7 @@ typedef struct Unit {
     int         cell;               /* 0..7 around the 3x3, -1 if whole room */
     int         ntiles, tw, th;
     char        title[96];
+    Disasm     *dis;                /* every alcove of a chamber is lit at once */
 } Unit;
 
 typedef enum {
@@ -161,7 +168,7 @@ typedef struct Room {
     int         cellw, cellh;       /* chamber cell size; 0 if not RT_GROUP */
     Unit       *units;              /* NULL when the room is its own unit */
     int         nunits;
-    int         activeUnit;         /* alcove currently decoded, -1 if none */
+    int         activeUnit;         /* alcove being stood at, -1 if none */
 
     int         linkPrev, linkNext; /* interior doors to neighbours */
 
@@ -222,13 +229,27 @@ void  city_free(City *c);
 void  floor_realize(Building *b, int f);
 void  floor_release(Building *b);
 
-/* code rooms: decode on entry, throw away on exit */
+/* code rooms: decode on entry, throw away on exit.  A chamber decodes every
+   one of its alcoves, so the whole room lights up as you step through the
+   door rather than one sculpture at a time.                              */
 int   room_is_code(const Building *b, const Room *r);
 int   unit_is_code(const Building *b, const Unit *u);
 void  city_enter_room(City *c, int bi, int ri);   /* frees whatever was open */
-void  city_enter_unit(City *c, int bi, int ri, int ui);  /* one chamber alcove */
 void  city_leave_room(City *c);
 const char *elf_sym_at(const Elf *e, uint64_t addr, uint64_t *off);
+
+/* where an address lives: building, room, and chamber alcove (-1 if the
+   room is its own unit).  Returns 0 when nothing in the city covers it. */
+int   city_find_addr(const City *c, uint64_t addr, int *bi, int *ri, int *ui);
+
+/* the decoding a visitor is currently reading in this room: a plain room's
+   own, or the alcove being stood at                                      */
+static inline Disasm *room_dis(const Room *r){
+    if (!r) return NULL;
+    if (r->kind != RT_GROUP) return r->dis;
+    if (!r->units || r->activeUnit < 0 || r->activeUnit >= r->nunits) return NULL;
+    return r->units[r->activeUnit].dis;
+}
 
 /* geometry helpers shared by render + collision */
 static inline float bld_x0(const Building *b) { return b->bx - CORE_W; }
