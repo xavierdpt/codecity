@@ -4,3 +4,12 @@ codecity
 
 # screenshots from --shot
 *.ppm
+
+# asan build
+codecity-asan
+
+# gdb output
+crash.log
+
+# vendored debugger sources, fetched locally
+ddd/

@@ -3,6 +3,7 @@
 #include "render.h"
 #include "world.h"
 #include "text.h"
+#include "wisp.h"
 #include <GL/gl.h>
 #include <GL/glu.h>
 #include <math.h>
@@ -284,11 +285,16 @@ static const float ICOL[IC_COUNT][3] = {
 };
 
 /* P(t) on the quadratic arc from a to b, lifted in the middle */
-static void arc_point(const float a[3], const float b[3], float lift, float t, float out[3]){
+void arc_point(const float a[3], const float b[3], float lift, float t, float out[3]){
     float c[3] = { (a[0]+b[0])*0.5f, (a[1]+b[1])*0.5f + lift, (a[2]+b[2])*0.5f };
     float u = 1.0f - t;
     for (int i = 0; i < 3; i++)
         out[i] = u*u*a[i] + 2.0f*u*t*c[i] + t*t*b[i];
+}
+
+float arc_lift(const float a[3], const float b[3]){
+    float len = fabsf(a[0]-b[0]) + fabsf(a[2]-b[2]);
+    return clampf(0.45f + len * 0.14f, 0.35f, 2.4f);
 }
 
 static void draw_arc(const float a[3], const float b[3], float lift, float now, float phase){
@@ -399,6 +405,386 @@ static void draw_port(const Port *p, float nz, int hot, int near, float now){
     glEnable(GL_LIGHTING);
 }
 
+/* ------------------------------------------------------------------ */
+/* the wisp: a CPU state standing on the instruction it is executing   */
+/* ------------------------------------------------------------------ */
+/* The panel flies in the band between the tallest sculpture (1.55 m) and
+   the ceiling, over the middle of the serpentine, with a tether down to
+   the sculpture it belongs to.  The tether is the whole trick: without it
+   a floating panel is a HUD that happens to be in 3D.               */
+
+/* §7 puts the panel at 3.35 m, above the exit ports.  But the ports are on
+   the far wall only, and the panel follows the wisp around the middle of
+   the room, where the band above the sculptures (1.55 m) is clear all the
+   way up.  Hanging it lower buys the row height that makes it readable,
+   and keeps it nearer eye level, which matters more.               */
+#define WISP_Y     2.50f        /* the bottom of the plate, over the floor */
+#define TRAIL_Y    0.78f        /* the ghost cards sit in a band of their own,
+                                   clear of the room's own mnemonic labels */
+
+/* the decoding an alcove holds; the wisp's own copy is in wisp.c */
+static const Disasm *unit_dis_of(const Room *r, int unit){
+    if (!r) return NULL;
+    if (unit < 0) return r->dis;
+    if (!r->units || unit >= r->nunits) return NULL;
+    return r->units[unit].dis;
+}
+
+/* §7's trail: the last sixteen states, hanging over the sculptures they
+   belonged to and fading with age.  It is what makes a room read as a
+   timeline you can walk under and look back along -- the one thing a
+   static listing cannot do at all.                                  */
+static void draw_trail(const Wisp *w, const Room *r, App *a, float dist){
+    if (dist > 22.0f || w->ntrail < 2) return;
+    float px = a->p.x, pz = a->p.z;
+    int first = w->ntrail > WISP_TRAIL ? w->ntrail - WISP_TRAIL : 0;
+
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    /* the thread first, so the order of the cards is unambiguous */
+    glColor4f(0.40f, 0.72f, 0.90f, 0.30f);
+    glLineWidth(1.5f);
+    glBegin(GL_LINE_STRIP);
+    for (int k = first; k < w->ntrail - 1; k++){
+        const struct WTrail *e = &w->trail[k % WISP_TRAIL];
+        const Disasm *d = unit_dis_of(r, e->unit);
+        if (!d || e->idx < 0 || e->idx >= d->n) continue;
+        const Insn *t = &d->ins[e->idx];
+        glVertex3f(t->x, t->y + t->h + TRAIL_Y, t->z);
+    }
+    glEnd();
+    glLineWidth(1.0f);
+
+    glEnable(GL_TEXTURE_2D);
+    for (int k = first; k < w->ntrail - 1; k++){
+        const struct WTrail *e = &w->trail[k % WISP_TRAIL];
+        const Disasm *d = unit_dis_of(r, e->unit);
+        if (!d || e->idx < 0 || e->idx >= d->n) continue;
+        const Insn *t = &d->ins[e->idx];
+        float dx = t->x - px, dz = t->z - pz;
+        if (dx*dx + dz*dz > 400.0f) continue;
+        float age = w->clock - e->at;
+        float fade = 1.0f - age / WISP_TRAIL_S;
+        if (fade <= 0.02f) continue;
+        /* a guessed branch is a different colour from a decided one --
+           the cheapest honesty feature in the whole design (§6) */
+        float al = 0.30f + 0.70f * fade;
+        if (e->kind == ST_CALL_OVER)      glColor4f(0.98f, 0.66f, 0.90f, al);
+        else if (!e->decided)             glColor4f(1.00f, 0.78f, 0.38f, al);
+        else                              glColor4f(0.80f, 0.93f, 1.00f, al);
+        /* the older half keeps only its mnemonic: a column of full lines
+           is unreadable, and the recent ones are what you are reading */
+        char one[48];
+        if (fade < 0.55f){
+            int k2 = 0;
+            while (e->note[k2] && e->note[k2] != ' ' && k2 < 15) k2++;
+            memcpy(one, e->note, (size_t)k2); one[k2] = 0;
+        } else snprintf(one, sizeof one, "%s", e->note);
+        text_mono_billboard(t->x, t->y + t->h + TRAIL_Y, t->z, 0.055f, one);
+    }
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glEnable(GL_LIGHTING);
+}
+
+static void wisp_ring(const Insn *t, float now, float r, float g, float b){
+    glColor4f(r, g, b, 0.55f + 0.35f * sinf(now * 4.4f));
+    glLineWidth(2.5f);
+    glBegin(GL_LINE_LOOP);
+    for (int k = 0; k < 24; k++){
+        float ang = k / 24.0f * 6.2831853f;
+        glVertex3f(t->x + cosf(ang) * 0.46f, t->y + 0.055f, t->z + sinf(ang) * 0.46f);
+    }
+    glEnd();
+    glLineWidth(1.0f);
+}
+
+/* one row of the panel, left-aligned at (x,y) in the panel's own plane */
+static void panel_row(const float o[3], const float rv[3], const float uv[3],
+                      float col, float row, float th, const char *s){
+    float p[3];
+    for (int i = 0; i < 3; i++) p[i] = o[i] + rv[i] * col + uv[i] * row;
+    text_mono_3d(p, rv, uv, th, 0, s);
+}
+
+static void draw_wisp(const Building *b, const Room *r, App *a, const Disasm *d,
+                      int myunit, float x0, float x1, float base){
+    Wisp *w = a->wisp;
+    if (!w || !w->running || !d || !d->n) return;
+
+    /* Where the token stands.  Normally on the instruction being executed;
+       when the wisp has gone on without you, on the call it went out by --
+       so its state can be watched from the room it left, which is the
+       point of being allowed to stay behind.                         */
+    const Insn *doorIn = NULL;
+    if (a->wispAway){
+        if (!a->wispDoorAddr || a->wispDoorBi != a->p.inside ||
+            a->wispDoorRi != a->p.room) return;
+        int at = disasm_index_of(d, a->wispDoorAddr);
+        if (at < 0) return;
+        doorIn = &d->ins[at];
+    } else {
+        if ((myunit < 0 ? -1 : myunit) != w->unit) return;
+        if (w->cur < 0 || w->cur >= d->n) return;
+    }
+    (void)b; (void)x0; (void)x1;
+
+    const Insn *t = doorIn ? doorIn : &d->ins[w->cur];
+    float body[3];
+    if (doorIn){ body[0] = t->x; body[1] = t->y + t->h + 0.16f; body[2] = t->z; }
+    else wisp_pos(w, r, body);
+    float px = a->p.x, pz = a->p.z, now = a->now;
+    float dx = body[0] - px, dz = body[2] - pz;
+    float dist = sqrtf(dx*dx + dz*dz);
+
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    /* the cursor ring: where the machine is, deliberately not the colour of
+       the ring that says where you are standing */
+    if (dist < 30.0f){
+        if (doorIn) wisp_ring(t, now, 1.00f, 0.78f, 0.32f);   /* amber: its door */
+        else        wisp_ring(t, now, w->done ? 0.85f : 0.35f,
+                              w->done ? 0.40f : 0.95f, 0.98f);
+    }
+
+    /* the body */
+    float bl = w->done ? 0.5f : 0.85f + 0.15f * sinf(now * 5.1f);
+    if (doorIn) glColor4f(1.00f * bl, 0.80f * bl, 0.38f * bl, 0.90f);
+    else        glColor4f(0.55f * bl, 0.95f * bl, 1.0f * bl, 0.95f);
+    glPushMatrix();
+    glTranslatef(body[0], body[1], body[2]);
+    gluSphere(g_q, 0.11f, 10, 8);
+    glPopMatrix();
+
+    /* the tether, from the panel down to the body */
+    float top = base + WISP_Y;
+    /* while it is away the panel hangs over the door, not over wherever the
+       body's easing left it in another room */
+    float panx = (doorIn || !w->posed) ? body[0] : w->px;
+    float panz = (doorIn || !w->posed) ? body[2] : w->pz;
+    if (doorIn) glColor4f(1.00f, 0.78f, 0.35f, 0.30f);
+    else        glColor4f(0.45f, 0.85f, 1.0f, 0.30f);
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glVertex3f(body[0], body[1], body[2]);
+    glVertex3f(panx, top, panz);
+    glEnd();
+    glLineWidth(1.0f);
+
+    /* §7's level of detail.  The panel's rows are 0.058 m, which stops
+       being readable somewhere around eight metres; past that it is
+       clutter, so it collapses to the token and its mnemonic, and past
+       twenty-five metres to the tether alone.                       */
+    if (dist > 25.0f){ glEnable(GL_LIGHTING); glDisable(GL_BLEND); return; }
+    if (dist > 8.0f){
+        glEnable(GL_TEXTURE_2D);
+        glColor4f(doorIn ? 1.0f : 0.72f, doorIn ? 0.82f : 0.95f,
+                  doorIn ? 0.40f : 1.0f, 0.92f);
+        text_mono_billboard(body[0], body[1] + 0.34f, body[2],
+                            0.028f * dist < 0.10f ? 0.10f : 0.028f * dist,
+                            doorIn ? "away" : t->mnem);
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+        if (!doorIn) draw_trail(w, r, a, dist);
+        return;
+    }
+
+    /* The panel faces the camera outright.  It lives at head height plus
+       two metres, so a plate that stayed upright would be read at a steep
+       angle from anywhere in the room and foreshorten into a slot.    */
+    float yaw = a->p.yaw, pit = a->p.pitch;
+    float rv[3] = { -sinf(yaw), 0, cosf(yaw) };
+    float uv[3] = { -cosf(yaw) * sinf(pit), cosf(pit), -sinf(yaw) * sinf(pit) };
+
+    /* The free band is 3.30 m (the top of the port panels) to the ceiling at
+       4.00, so the plate has about 0.65 m to live in: lay the registers out
+       in as many columns as it takes to stay inside that.              */
+    const int full = 1;
+    const Vm *m = &w->vm;
+    /* §1: r8..r15 are folded unless something has changed them, and so is
+       every register met along the way.  The first eight and the program
+       counter are always there, so the shape of the panel does not jump
+       around as a run touches things.                               */
+    int show[VM_NREG], nshow = 0;
+    for (int i = 0; i < m->nreg && nshow < VM_NREG; i++){
+        int always = (i < 8) || i == m->pcSlot || i == m->spSlot;
+        if (always || m->r[i].prov != PV_NONE) show[nshow++] = i;
+    }
+    if (!nshow) show[nshow++] = 0;
+    int cols = (nshow + 6) / 7; if (cols < 1) cols = 1; if (cols > 5) cols = 5;
+    int per  = (nshow + cols - 1) / cols;
+    float th   = 0.058f;                    /* glyph height */
+    float lead = th * 1.30f;
+    float colw = text_mono_width(th, "rax ~0000000000000000  ");
+    int rows = full ? per + 5 : 2;
+    float pw   = full ? colw * cols + 0.10f
+                      : text_mono_width(th, "  0x0000000000000000  ") + 0.10f;
+    float ph   = rows * lead + 0.10f;
+
+    float o[3] = { panx - rv[0] * pw * 0.5f, top, panz - rv[2] * pw * 0.5f };
+
+    /* the plate behind the text */
+    float e0[3], e1[3], e2[3], e3[3];
+    for (int i = 0; i < 3; i++){
+        e0[i] = o[i];
+        e1[i] = o[i] + rv[i] * pw;
+        e2[i] = o[i] + rv[i] * pw + uv[i] * ph;
+        e3[i] = o[i] + uv[i] * ph;
+    }
+    glColor4f(0.03f, 0.06f, 0.09f, 0.82f);
+    glBegin(GL_QUADS);
+    glVertex3fv(e0); glVertex3fv(e1); glVertex3fv(e2); glVertex3fv(e3);
+    glVertex3fv(e3); glVertex3fv(e2); glVertex3fv(e1); glVertex3fv(e0);
+    glEnd();
+    glColor4f(0.35f, 0.75f, 0.95f, 0.55f);
+    glBegin(GL_LINE_LOOP);
+    glVertex3fv(e0); glVertex3fv(e1); glVertex3fv(e2); glVertex3fv(e3);
+    glEnd();
+
+    /* the text sits a centimetre in front of the plate: exactly coplanar,
+       it z-fights with it and loses */
+    float fwd[3] = { cosf(yaw) * cosf(pit), sinf(pit), sinf(yaw) * cosf(pit) };
+    float ot[3] = { o[0] - fwd[0] * 0.012f, o[1] - fwd[1] * 0.012f, o[2] - fwd[2] * 0.012f };
+
+    glEnable(GL_TEXTURE_2D);
+    char line[128], ann[64];
+    float y = ph - lead - 0.03f, x = 0.06f;
+
+    if (!full){
+        glColor4f(0.90f, 0.96f, 1.0f, 0.95f);
+        snprintf(line, sizeof line, "  0x%llx", (unsigned long long)t->addr);
+        panel_row(ot, rv, uv, x, y, th, line);
+        glColor4f(0.75f, 0.92f, 0.70f, 0.95f);
+        snprintf(line, sizeof line, "  %s %.14s", t->mnem, t->ops);
+        panel_row(ot, rv, uv, x, y - lead, th, line);
+        glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+        return;
+    }
+
+    /* header: what this is, and that it is not real */
+    glColor4f(1.00f, 0.72f, 0.42f, 0.95f);
+    /* the room it is really in, when that is not this one */
+    const Insn *live = t;
+    const char *awayRoom = NULL;
+    if (doorIn && a->wispBi >= 0 && a->wispBi < a->city->nbld){
+        Building *wb = &a->city->bld[a->wispBi];
+        if (a->wispRi >= 0 && a->wispRi < wb->nrooms){
+            Room *wr = &wb->rooms[a->wispRi];
+            const Insn *wi = wisp_insn(w, wr);
+            if (wi) live = wi;
+            awayRoom = wr->title;
+        }
+    }
+    snprintf(line, sizeof line, "SIMULATED  step %u  fuel %d  cpu %s%s%s",
+             m->steps, m->fuel, vm_cpu_name(),
+             doorIn ? "  AWAY" : "",
+             w->paused ? "  PAUSED" : (w->done ? "  DONE" : ""));
+    panel_row(ot, rv, uv, x, y, th, line);
+    y -= lead * 1.15f;
+
+    /* the registers, in the architecture's own order */
+    for (int j = 0; j < nshow; j++){
+        int i = show[j];
+        const VReg *g = &m->r[i];
+        char tag = g->prov == PV_INVENTED ? '~' : (g->prov == PV_FILE ? '=' :
+                   (g->prov == PV_CALL ? '*' : ' '));
+        if (g->prov == PV_NONE) snprintf(line, sizeof line, "%-4s", m->rname[i]);
+        else snprintf(line, sizeof line, "%-4s%c%016llx", m->rname[i], tag,
+                      (unsigned long long)g->v);
+        /* a value written by the step just gone glows */
+        int fresh = g->prov != PV_NONE && m->steps && g->stamp == m->steps;
+        if (g->prov == PV_NONE)          glColor4f(0.50f, 0.54f, 0.60f, 0.9f);
+        else if (fresh)                  glColor4f(1.00f, 0.95f, 0.60f, 1.0f);
+        else if (g->prov == PV_INVENTED) glColor4f(0.56f, 0.62f, 0.68f, 0.95f);
+        else if (g->prov == PV_FILE)     glColor4f(0.70f, 0.95f, 0.80f, 1.0f);
+        else                             glColor4f(0.80f, 0.86f, 0.92f, 0.95f);
+        panel_row(ot, rv, uv, x + (j / per) * colw, y - (j % per) * lead, th, line);
+    }
+    y -= per * lead;
+
+    /* §4.4: the one vector register the last instruction touched, split
+       into the lanes it actually operated on -- eight int16 for a paddw,
+       sixteen bytes for a pcmpeqb.  Far more legible than 32 hex digits,
+       and it is what someone reading a codec kernel wants to see.    */
+    if (m->vecSlot >= 0){
+        uint8_t vb[VM_VBYTES];
+        vm_vget((Vm *)m, m->vecSlot, VM_VBYTES, vb);
+        int ew = m->vecEw ? m->vecEw : 16, nb = m->vecBytes ? m->vecBytes : 16;
+        int wn2 = snprintf(line, sizeof line, "xmm%d ", m->vecSlot);
+        for (int o2 = 0; o2 + ew <= nb && wn2 < 110; o2 += ew){
+            unsigned long long uv2 = 0;
+            for (int q = ew - 1; q >= 0; q--) uv2 = (uv2 << 8) | vb[o2 + q];
+            long long lv = (long long)uv2;
+            if (ew < 8){                       /* signed, as the lanes are */
+                unsigned long long sb = 1ull << (ew * 8 - 1);
+                lv = (long long)((uv2 ^ sb) - sb);
+            }
+            wn2 += snprintf(line + wn2, sizeof line - (size_t)wn2, "%lld ", lv);
+        }
+        if (nb > 16) snprintf(line + wn2, sizeof line - (size_t)wn2, "+128");
+        glColor4f(0.80f, 0.70f, 0.98f, 0.95f);
+        panel_row(ot, rv, uv, x, y, th, line);
+        y -= lead;
+    }
+
+    /* flags: a known bit each, so ignorance is precise rather than a lie */
+    int wn = 0;
+    wn += snprintf(line + wn, sizeof line - (size_t)wn, "flags ");
+    static const char *FN[VF_COUNT] = { "CF","PF","AF","ZF","SF","OF" };
+    for (int i = 0; i < VF_COUNT; i++)
+        wn += snprintf(line + wn, sizeof line - (size_t)wn, "%s%c ", FN[i],
+                       (m->flknown & (1u << i)) ? (char)('0' + m->fl[i]) : '?');
+    glColor4f(0.72f, 0.78f, 0.86f, 0.95f);
+    panel_row(ot, rv, uv, x, y, th, line);
+    y -= lead;
+
+    /* the instruction under the cursor, and what it disturbed */
+    glColor4f(doorIn ? 1.0f : 0.98f, doorIn ? 0.82f : 0.94f, doorIn ? 0.45f : 0.55f, 1.0f);
+    snprintf(line, sizeof line, "> %llx  %s %.28s",
+             (unsigned long long)live->addr, live->mnem, live->ops);
+    panel_row(ot, rv, uv, x, y, th, line);
+    y -= lead;
+
+    glColor4f(0.62f, 0.70f, 0.78f, 0.92f);
+    if (doorIn){
+        snprintf(line, sizeof line, "  it went in here and is now in %.28s   [J] catch up",
+                 awayRoom ? awayRoom : "another room");
+        panel_row(ot, rv, uv, x, y, th, line);
+        glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+        return;
+    }
+    if (w->done)
+        snprintf(line, sizeof line, "  %s", w->why);
+    else if (t->taddr && vm_annotate(m, t->taddr, ann, sizeof ann)[0])
+        snprintf(line, sizeof line, "  -> %s%s", ann, w->decided ? "" : "  (guessed)");
+    else if (w->kind == ST_CALL_OVER && m->lastCall[0])
+        snprintf(line, sizeof line, "  call %s  ->  rax = %llx  (stepped over)",
+                 m->lastCall, (unsigned long long)m->lastCallRv);
+    else if (m->nmem){
+        /* the last memory reference: address, direction, and where the
+           value came from -- §1's fourth piece of a state */
+        int i = (m->nmem - 1) % VM_MEMLOG;
+        vm_annotate(m, m->mem[i].addr, ann, sizeof ann);
+        snprintf(line, sizeof line, "  %s%d 0x%llx = %llx  %s%s%s",
+                 m->mem[i].wr ? "wrote " : "read ", m->mem[i].n * 8,
+                 (unsigned long long)m->mem[i].addr,
+                 (unsigned long long)m->mem[i].val,
+                 vm_prov_name(m->mem[i].prov), ann[0] ? "  " : "", ann);
+    } else
+        snprintf(line, sizeof line, "  the inputs are invented; the arithmetic on"
+                                    " them is real");
+    panel_row(ot, rv, uv, x, y, th, line);
+
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glEnable(GL_LIGHTING);
+
+    if (!doorIn) draw_trail(w, r, a, dist);   /* the trail is in the other room */
+}
+
 /* One decoding, laid out and drawn: a plain room's own, or one alcove of a
    chamber.  myunit is that alcove, or -1 when the room is its own unit.  */
 static void draw_code_room(const Building *b, const Room *r, App *a, Disasm *d, int myunit,
@@ -450,8 +836,7 @@ static void draw_code_room(const Building *b, const Room *r, App *a, Disasm *d, 
         if (dx*dx + dz*dz > 1000.0f) continue;
         float A[3] = { t->x, t->y + t->h + 0.06f, t->z };
         float B[3] = { u->x, u->y + u->h + 0.06f, u->z };
-        float len = fabsf(A[0]-B[0]) + fabsf(A[2]-B[2]);
-        float lift = clampf(0.45f + len * 0.14f, 0.35f, 2.4f);
+        float lift = arc_lift(A, B);
         if (t->cls == IC_CALL)          glColor4f(0.95f, 0.45f, 0.85f, 0.92f);
         else if (t->tunit >= 0)         glColor4f(0.60f, 0.95f, 0.70f, 0.85f);   /* next alcove */
         else if (t->target > i)         glColor4f(0.35f, 0.88f, 0.98f, 0.85f);   /* onward */
@@ -513,8 +898,12 @@ static void draw_code_room(const Building *b, const Room *r, App *a, Disasm *d, 
        is a solid rectangle of whatever colour is current.                */
     glEnable(GL_TEXTURE_2D);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* A wisp's trail labels the same sculptures with something better, so
+       the room's own mnemonics stand down while one is walking here.  */
     int nlab = 0;
-    for (int i = 0; i < d->n && nlab < 12; i++){
+    int hushed = a->wisp && a->wisp->running &&
+                 (myunit < 0 ? -1 : myunit) == a->wisp->unit;
+    for (int i = 0; i < d->n && nlab < 12 && !hushed; i++){
         const Insn *t = &d->ins[i];
         if (t->cls != IC_JUMP && t->cls != IC_CJUMP && t->cls != IC_CALL &&
             t->cls != IC_RET  && t->cls != IC_SYSCALL) continue;
@@ -528,6 +917,9 @@ static void draw_code_room(const Building *b, const Room *r, App *a, Disasm *d, 
     (void)py;
     glDisable(GL_BLEND);
     glEnable(GL_LIGHTING);
+
+    /* last, so it composites over the ports and the wires */
+    draw_wisp(b, r, a, d, myunit, x0, x1, base);
 }
 
 /* ------------------------------------------------------------------ */
@@ -967,6 +1359,43 @@ void render_init(void){
     glHint(GL_PERSPECTIVE_CORRECTION_HINT, GL_NICEST);
 }
 
+/* ------------------------------------------------------------------ */
+/* §13's test in world space -- the text_mono_3d path                   */
+/* ------------------------------------------------------------------ */
+/* hud_stress() runs the 2D half of the test.  This is the same idea in
+   the world: a panel of sixteen registers whose values are new every
+   frame, floating three metres in front of the player, drawn with one
+   texture bind and one quad per glyph.  It is the shape of the panel the
+   wisp will eventually carry under the ceiling, and it is here now so
+   the 3D path is exercised rather than merely compiled.              */
+static void draw_stress_3d(App *a){
+    static unsigned rng = 88675123u;
+    static const char *REG[16] = { "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+                                   "r8 ","r9 ","r10","r11","r12","r13","r14","r15" };
+    Player *p = &a->p;
+    float fx = cosf(p->yaw), fz = sinf(p->yaw);
+    float r[3] = { -sinf(p->yaw), 0, cosf(p->yaw) };
+    float u[3] = { 0, 1, 0 };
+    float o[3] = { p->x + fx * 3.0f, p->y + EYE_H + 0.85f, p->z + fz * 3.0f };
+    const float lh = 0.16f;
+
+    glDisable(GL_LIGHTING);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.72f, 0.95f, 0.80f, 0.95f);
+    for (int i = 0; i < 16; i++){
+        char t[64];
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        unsigned hi = rng;
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        snprintf(t, sizeof t, "%s 0x%08x%08x", REG[i], hi, rng);
+        float q[3] = { o[0], o[1] - i * lh * 1.25f, o[2] };
+        if (a->stress == 1) text_mono_3d(q, r, u, lh, 1, t);
+        else                text_3d(FNT_MONO, q, r, u, lh, 1, t);
+    }
+    glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+}
+
 void render_scene(App *a){
     City *c = a->city;
     Player *p = &a->p;
@@ -1086,5 +1515,6 @@ void render_scene(App *a){
 
     draw_monument(a);
     draw_portals(a);
+    if (a->stress) draw_stress_3d(a);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 }

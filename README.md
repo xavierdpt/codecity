@@ -144,6 +144,13 @@ you step in rather than one sculpture at a time as you walk between them.
 | `F` | file browser — arrows, type to filter, `Enter` to open, `Backspace` to edit |
 | `M` `G` `V` `R` | minimap, wireframe, free-fly, back to the plaza |
 | `F1` | controls and legend |
+| `F2` | text stress test: 200 never-repeated strings a frame, first out of the monospace atlas, then through the string cache |
+| `X` | start (or stop) a **wisp** in the code room you are standing in — a CPU state that walks it |
+| `K` `-` `=` `N` | run / pause · slower · faster · a different run |
+| `T` / `I` | **step over** one instruction (a call is run whole) / **step into** the call. `F10` / `F11` do the same |
+| `Shift+X` | the whole state sheet — every register with what it points at, the flags, the stack, the last memory references |
+| `Tab` (with a wisp running) | the room detail sheet follows the *machine* instead of your feet, with a visit count against every line |
+| `P` | **pilot mode** — start at the entry point and let the wisp lead: it walks through the ports and you go with it. It starts *paused*: step it with `T` and `I`, or press `K` to let it run |
 | `Ctrl+Q` | quit |
 
 ## Source layout
@@ -155,9 +162,16 @@ you step in rather than one sculpture at a time as you walk between them.
 | `src/city.c` | the mapping above — rooms, floors, tower proportions, district and city packing, lazily decoded table text, and the enter/leave lifecycle of a code room |
 | `src/world.c` | wall and slab geometry, the spiral-stair height field, collision, player physics |
 | `src/render.c` | the drawing — exteriors baked into display lists, interiors drawn per floor |
-| `src/text.c` | strings rendered by SDL2_ttf into cached GL textures, for signs, plates and the HUD; the cache is bounded in bytes as well as entries, and never evicts a string the frame in progress has already drawn |
+| `src/text.c` | strings rendered by SDL2_ttf into cached GL textures, for signs, plates and the HUD; the cache is bounded in bytes as well as entries, and never evicts a string the frame in progress has already drawn. Beside it, a monospace glyph atlas — the 95 printable ASCII of `FNT_MONO` rasterized once — for text whose *content* changes every frame, which the cache cannot hold |
+| `src/vm.c` | the machine a wisp carries: registers keyed by Capstone id with x86's sub-register write rule, flags with a known bit each, three memory layers (shadow, the mapped file, invention), and the tier-0 fallback that models no instruction semantics at all |
+| `src/vmx86.c` | tier 1: what the ~70 integer instructions actually do, and the sixteen condition predicates. Every rule in it was checked against hardware |
+| `src/vmcpu.c` | a virtual CPU for `cpuid` and `xgetbv` to answer: three profiles from the x86-64 psABI levels, plus the host's own. A codec dispatches on this, so it decides which kernel a wisp walks into |
+| `src/vmsimd.c` | tiers 2 and 3: scalar float, packed moves, packed shuffle/compare and packed integer arithmetic — written as a loop over *(element width, lane count, operand count)*, never as 128-bit two-operand functions, so AVX2 is the same code at another lane count |
+| `src/vmcheck.c` | replays `tests/vm-corpus.txt` — states a real CPU produced — through `vmx86.c` and reports any divergence, and counts how much of a file's text is reachable with no analysis at all |
+| `tools/oracle.c`, `tools/oracle.py` | the generator for that corpus: a gdb script that single-steps one instruction at a time from a chosen register state. Needs gdb and an x86 host; the everyday test does not |
+| `src/wisp.c` | the body: which instruction the state is standing on, how it eases to the next one, the per-instruction visit counts the loop policy needs |
 | `src/hud.c` | readouts, minimap, detail sheet, help, file browser |
-| `src/main.c` | window, event loop, file loading, and the three headless modes |
+| `src/main.c` | window, event loop, file loading, and the four headless modes |
 
 ## Headless modes
 
@@ -169,9 +183,57 @@ you step in rather than one sculpture at a time as you walk between them.
                             # frees it, and that every port in a code room can be
                             # aimed at and leads to a room that holds its address.
                             # Non-zero exit on failure.
-./codecity FILE --shot DIR   # renders fourteen canned viewpoints to DIR/*.ppm
+./codecity FILE --shot DIR   # renders eighteen canned viewpoints to DIR/*.ppm
 ./codecity FILE --bench      # frame time in the busiest code room it can find
+./codecity FILE --textbench  # 200 never-repeated strings a frame, drawn out of the
+                            # monospace atlas and then through the string cache
+./codecity FILE --vmtest     # replay the hardware corpus through the interpreter,
+                            # then run a wisp in every code room of the first eight
+                            # code towers; asserts zero divergence from hardware, that
+                            # every run terminates, allocates a bounded number of
+                            # shadow pages, frees everything, does not move
+                            # disasm_live(), and takes the same path twice.  -v shows
+                            # the first twenty divergences
+./tools/gen-corpus.sh        # regenerate tests/vm-corpus.txt from this machine's CPU
+                            # (needs gdb and an x86-64 host; --vmtest does not)
 ```
+
+`--cpu baseline|v2|v3|host` picks the CPU a wisp's `cpuid` answers as —
+`baseline` by default, which is x86-64-v1 and what the compiler assumed.
+
+### The same call site, two different rooms
+
+`git`, `bash` and this program never execute a `cpuid` at all: for ordinary
+application code it is a loader phenomenon, done once inside `ld.so` and
+written into a struct. Codec libraries invert that — `libvpx` has fifteen of
+them, in its own code, with no IFUNC in sight. A resolver that dereferences
+`ld.so`'s data cannot be run honestly; a `cpuid` can, because it is a pure
+function of `(eax, ecx)` and a small table.
+
+So `--cpu` is not a curiosity for those libraries. It is the control that
+decides which kernel a wisp walks into, and `--selftest` demonstrates it:
+it finds a `cpuid`, walks the function it sits in under each profile, and
+reports where the paths part company.
+
+```
+libvpx.so.7   a cpuid at 0x9d6b; walking the function it is in:
+  baseline    cpuid.1 ecx=00000000  7.0 ebx=00000000  xcr0=3   27 instructions
+  v2          cpuid.1 ecx=02982203  7.0 ebx=00000000  xcr0=3   27 instructions
+  v3          cpuid.1 ecx=3ed83203  7.0 ebx=00000128  xcr0=7   39 instructions
+  they part company at step 25, address 0x9d88:
+    baseline  goes to 0x9d8a          <- pop rbx; ret
+    v2        goes to 0x9d8a
+    v3        goes to 0x9da0          <- xgetbv, and on into the AVX2 path
+```
+
+`0x9d88` is `je 0x9da0`, immediately after `and ecx, 0x18000000` — the test for
+OSXSAVE and AVX together. Under `baseline` and `v2` the wisp falls through and
+returns; under `v3` it takes the branch and walks into the code that checks
+`xcr0` and then asks for leaf 7. The same instruction, two answers, two rooms.
+
+**AVX-512 is absent from every profile on purpose.** It is not modelled, and a
+profile that advertised it would send a wisp into code the interpreter could
+only havoc.
 
 `--selftest` passes on 60 binaries and libraries from `/usr/bin` and
 `/usr/lib/x86_64-linux-gnu`, and on the kernel's 32- and 64-bit vDSOs, which is
@@ -180,6 +242,270 @@ message.
 
 `--bench` in a 640-instruction room with 251 wires: ~405 fps, 2.5 ms/frame on
 Mesa/Iris Xe. The live app is vsync-capped to 60.
+
+### A wisp: a CPU state that walks the room
+
+Press `X` inside a code room and a state appears on the first instruction: a
+panel of registers and flags hanging over the serpentine, a tether down to the
+sculpture being executed, and a ring around it. It steps along the path the
+code actually takes — a taken branch rides the same arc the wire is drawn with
+— and stops at a `ret`, at a port out of the room, or when its fuel runs out.
+
+**It is not execution, and the panel says so.** There is no kernel, no loader,
+no libc; the inputs are invented. What it *is* is consistent: the first read of
+anything with no value mints one from a PRNG seeded off the room's address and
+writes it back, so the same room shows the same run every time you walk into
+it. A `~` before a value means it was invented; nothing here was observed.
+
+The arithmetic is real. **Tier 1** interprets about seventy integer
+instructions — the moves and their sub-register rules, add/sub/adc/sbb, the
+logic three, the shifts, multiply and divide, the bit scans, the stack, and
+`setcc`/`cmovcc`/`jcc` across all sixteen conditions — so a branch is decided by
+the flags rather than by a coin. **Tier 0** is underneath it for everything else
+and for every other architecture: Capstone says which registers an instruction
+reads and writes and which flags it disturbs, so the fallback materialises the
+reads, havocs the writes, and clears the known bit on the flags — `CF? ZF?`
+rather than a number it cannot justify. That is why an AArch64 or MIPS binary
+still gets a walker, from the same code, with no per-architecture work.
+
+A run starts in a frame of its own: `rsp` in the middle of a synthetic
+64 KiB stack with a **sentinel return address** already on it, `rbp` equal to
+it, one constant **stack canary** at `fs:0x28`, and the file's
+**relocations applied into the shadow** so the GOT resolves. A `call` is not
+followed — the city keeps exactly one room decoded at a time — but its
+*contract* is: `rax` is whatever it is pretending to have returned, the
+caller-saved registers are gone, `rsp` is untouched. About thirty libc
+callees have a return model, so `strcmp` can say "equal" and `getenv` can say
+"nothing", which is the difference between a search loop that ends and one
+that runs until its fuel does. When `ret` pops the sentinel, the function has
+returned to its caller and the run is over.
+
+Behind it trails the last sixteen states, as ghost cards hanging over the
+sculptures they belonged to and fading with age — newest in full, older ones
+collapsed to their mnemonic, orange where the branch was guessed rather than
+worked out from the flags. The room then reads as a **timeline you can walk
+under and look back along**, which is the one thing a static listing cannot do
+at all. Close up you get the full panel; past eight metres it collapses to the
+token and its mnemonic; past twenty-five, to the tether alone.
+
+### Following the code through the city
+
+`P` starts the walk the whole thing exists for. It puts you at the file's
+entry point, starts a wisp there, and hands it the wheel: when a run reaches a
+way out of the room, the app does exactly what stepping through that port by
+hand does — you *walk through the door* — and the run continues in the new room
+with the same CPU state. That state owns nothing belonging to a decoding, so it
+survives the move for free, and because the player moves too, the city's rule
+that exactly one room is decoded at a time is never in question.
+
+In pilot mode a call is really **made** rather than stepped over: the return
+address goes on the synthetic stack, so `ret` pops it and brings you back to
+the room you called from, with whatever the callee actually left in the
+registers. Three things it declines to follow, because there is nothing there
+to walk: a symbol this file does not define, a jump into one (a tail call —
+the contract runs and the wisp returns instead), and an `R_X86_64_IRELATIVE`
+resolver. The one exception is `__libc_start_main`, whose first argument is
+`main` — the single hand-off every dynamically linked C program makes, and
+without it a walk from the entry point ends after thirteen instructions.
+
+### Step by step
+
+`P` leaves the wisp **paused** on the entry point: nothing moves until you say
+so. Then `T` steps and `I` steps in, and the difference is what they do at a
+call. (`F10` and `F11` are bound to the same two, out of debugger habit. The
+keys are letters on purpose: a keycode for a letter is the same key on every
+layout, and punctuation is not — `.` on a French keyboard is Shift+`;`, which
+arrives as a different keysym altogether.)
+
+`I` makes the call and stops on the callee's first instruction, taking you
+with it — one instruction, into another room.
+
+`T` steps *over*: one instruction, except that a call which is really made is
+not one instruction, and pretending otherwise is what a step-over contract
+does. So the callee is actually run. You stay at the call site — the call keeps
+its mark on the sculpture you are standing at — and the wisp goes off through
+the doors on its own, at its own rate, with the readout saying which room it
+has reached. `[J]` at any point takes you to it, and puts the run back under
+your hand where it stands. Otherwise it comes back by itself: the moment the
+call depth returns to what it was when you pressed the key, the wisp stops,
+knocks at your door, and `[E]` picks it up again — paused, on the instruction
+after the call, one address further on than where you left it.
+
+That last sentence is the contract `--selftest` checks, on both keys, pressing
+them through `app_key()` exactly as the event loop does:
+
+```
+ok   stepping      I lands inside the callee;  T runs the call whole and comes back one on
+```
+
+`--selftest` walks forty hops from `e_entry` on every binary it is given and
+asserts at each one that the room it landed in really covers the address it
+asked for and that exactly one room's worth of decoding is alive:
+
+```
+ls         40 hops from the entry point, 207 steps, 42 rooms, 2 calls deep
+git        40 hops from the entry point, 207 steps, 42 rooms, 3 calls deep
+bash       40 hops from the entry point, 155 steps, 42 rooms, 2 calls deep
+vim        40 hops from the entry point, 326 steps, 42 rooms, 5 calls deep
+python3    40 hops from the entry point, 254 steps, 42 rooms, 6 calls deep
+```
+
+`--vmtest` runs one in every code room and reports where they got to:
+
+| | `ls` | `git` | `bash` | `codecity` | AArch64 |
+|---|---|---|---|---|---|
+| code rooms | 80 | 600 | 600 | 118 | 1 |
+| handled by **tier 1** | 99.8% | **97.5%** | 99.7% | 80.1% | 0% |
+| conditionals **decided** | 100% | 99.9% | 99.9% | 96% | 0% |
+| ended at `ret` | 62% | 48% | 74% | 71% | 100% |
+| left the room | 16% | 17% | 10% | 10% | 0% |
+| ran out of fuel | 20% | 35% | 14% | 18% | 0% |
+| calls named | 80% | 28% | 89% | 100% | — |
+
+(that table is a **local** wisp — one room, calls stepped over, which is what
+`X` gives you; pilot mode is the other half.)
+
+`codecity` is the worst case in the table because it is float-heavy: scalar SSE
+is tier 2 and has not landed. The AArch64 column is tier 0 doing exactly what it
+is for. A running wisp costs **no measurable frame time**. `--bench` in a
+1848-instruction room: 3.16 ms without one, 3.12 ms with one running, its
+trail drawn and stepping an instruction every frame. It comes out marginally
+*cheaper*, and for a reason worth knowing: a wisp's trail labels the same
+sculptures the room's own control-flow mnemonics do, so those stand down while
+one is walking — and the trail draws through the monospace atlas below, where
+the labels it replaced went through the string cache.
+
+### What a pointer points at
+
+Two mechanisms find most of the text in a binary without a line of analysis:
+a RIP-relative operand naming an address in `.rodata` — the compiler's
+universal way of referring to a constant — and a relocation addend pointing
+there, which is how every array-of-strings is built. `--vmtest` measures both:
+
+| | strings in `.rodata` | by a `lea` | by a relocation | **by either** | left over |
+|---|---|---|---|---|---|
+| `git` | 12 950 | 85.6% | 17.1% | **99.8%** | 30 |
+| `bash` | 1 526 | 58.2% | 45.3% | **98.5%** | 23 |
+| `codecity` | 543 | 73.1% | 25.2% | **98.0%** | 11 |
+| `libx264.so.164` | 749 | 86.9% | 11.7% | **96.1%** | 29 |
+| `ls` | 479 | 36.1% | 14.8% | 50.7% | 236 |
+
+So when a register holds a pointer into a mapped section, the panel can print
+the string it names instead of sixteen hex digits. `ls` is the low outlier
+because it is small and most of its `.rodata` is not strings at all — the
+scan counts any printable NUL-terminated run of four bytes or more, and a
+table of small integers can look like one.
+
+### How much of a binary can be modelled
+
+Four tiers. Tier 1 is the integer base; tier 2 is scalar SSE float; tier 3 is
+the packed operations — bulk moves, shuffle/compare/logic, and the lane-wise
+arithmetic that is the actual work of a video codec. Below them tier 0 havocs
+precisely what Capstone says an instruction touches, on any architecture.
+
+`--vmtest` classifies every instruction in a file's executable sections by
+offering it to the real dispatchers on a throwaway machine — the classifier
+*is* the interpreter, so the table cannot drift from the code:
+
+| | instructions | tier 1 | tier 2 | tier 3 | **modelled** |
+|---|---|---|---|---|---|
+| `git` | 727 991 | 97.1% | 0.0% | 2.8% | **100.0%** |
+| `bash` | 241 699 | 99.3% | 0.0% | 0.7% | **100.0%** |
+| `libvlccore.so.9` | 182 502 | 97.2% | 0.5% | 2.2% | **100.0%** |
+| `libavcodec.so.60` | 2 689 541 | 91.4% | 1.3% | 7.2% | **99.9%** |
+| `libvpx.so.7` | 633 990 | 62.4% | 0.8% | 36.7% | **99.9%** |
+| `codecity` | 47 606 | 81.6% | 13.4% | 4.9% | **99.9%** |
+| `libswscale.so.7` | 135 012 | 85.3% | 0.8% | 13.2% | **99.3%** |
+| `libx264.so.164` | 368 904 | 78.9% | 1.6% | 18.9% | **99.3%** |
+| `libdav1d.so.7` | 293 494 | 52.6% | 0.0% | 42.6% | 95.1% |
+
+`libvpx` is the encouraging case: 62% of it is integer and it still comes out at
+99.9%, because an SSE2-era codec is almost entirely lane-wise arithmetic — add,
+subtract, multiply-accumulate, average, sum-of-absolute-differences over packed
+8- and 16-bit lanes. `libdav1d` is the hard one: AV1's SIMD is written for
+AVX2 and AVX-512, and **AVX-512 is deliberately not modelled** — it needs a
+`k` register file and predication threaded through every operation. What is
+left unmodelled in `dav1d` is almost entirely that: `vmovdqa32` and `vmovdqu32`
+are its two largest misses, and a further 13 526 bytes of it Capstone declines
+to decode at all.
+
+The same tier-3 loops run at 128 and at 256 bits — writing them over
+*(element width, lane count, operand count)* is what makes AVX2 the same code —
+and the hardware corpus is recorded 256 bits wide, so both are checked rather
+than assumed. Legacy SSE and VEX differ in one respect that only a
+256-bit-wide corpus can see: a VEX write zeroes everything above the
+destination and a legacy one leaves it exactly as it was.
+
+### Hardware as the oracle
+
+Coverage is not correctness: 97% of instructions modelled is not 97% of runs
+right, because one wrong `movzx` early poisons everything after it. So none of
+tier 1's rules were written from the manual and left there.
+`tools/gen-corpus.sh` builds a small RWX scratch page in a process under gdb,
+writes one instruction into it, sets the sixteen registers and the flags to a
+chosen vector, single-steps, and records what the CPU did.
+`tests/vm-corpus.txt` is 10 584 such vectors over 441 instruction forms and 24
+states — sixteen general registers, the flags, eight 256-bit vector registers
+and a 512-byte window of memory — checked in as data; `--vmtest` replays it
+through the interpreter and fails on any divergence. It needs neither gdb nor an x86 host to
+run, which is the whole reason the corpus is a file.
+
+Five rules came out of that and would otherwise have shipped as *plausible wrong
+numbers* rather than crashes:
+
+- a shift count is masked to **5** bits at width 4 and **6** at width 8, so
+  `shl eax, 33` shifts by one;
+- a shift of zero changes no flag — but still writes the destination, so
+  `shl eax, 0` zero-extends the top half of `rax` anyway;
+- `inc` and `dec` leave `CF` exactly as they found it;
+- `bsf`/`bsr` leave their destination **unchanged** when the source is zero;
+- a register write at width 4 zero-extends the whole 64-bit slot, at 1 and 2 it
+  merges — get that backwards and every pointer grows junk in its high bits;
+- `minss` returns one of its operands **bit for bit**, not the smaller number:
+  recomputing it through a `double` quiets a signalling NaN and changes the
+  answer;
+- `cvttss2si` of a NaN or an out-of-range float gives the *integer indefinite*
+  value, not whatever a C cast happens to do — which was returning zero;
+- a float operation on a NaN returns **that NaN's bits**, quieted; computing it
+  through a `double` and converting back invents a different NaN;
+- `ror eax, 0` rotates by nothing and sets no flag — and still writes its
+  destination, so it zero-extends `rax`, exactly as `shl eax, 0` does.
+
+Where the manual says a flag is *undefined*, the interpreter says so too rather
+than copying whatever this CPU happened to leave: asked 4872 times, hardware's
+`OF` after a shift by more than one is not a function of the inputs (no rule
+explains more than 65 of 87 `shl` vectors), so that flag comes back unknown and
+the `?` on the panel is the honest answer. `--vmtest` prints how many such
+comparisons were declined and for which instructions, so a missing rule cannot
+hide behind one.
+
+The generator itself needed a tripwire. Roughly one `stepi` in a hundred on this
+gdb resumes from the previous stop instead of the program counter just set,
+which silently records the wrong answer — it first showed up as a `pop` that
+appeared to *push*. The scratch page is therefore padded with `cld`, `DF` is set
+before every step, and any vector that comes back with `DF` clear has run a pad
+byte and is redone.
+
+### Text that changes every frame
+
+The string cache keys on content, so a readout that is different every frame is
+a TTF rasterization and a `glTexImage2D` upload every frame — and, worse, it
+evicts the room's own labels on the way past. Anything of that shape draws out
+of a monospace atlas instead: one texture, one quad per glyph, no rasterization
+at all. `--textbench` draws the same 200 never-repeated strings both ways:
+
+| path | ms/frame | vs. no panel | cache entries | cache MiB | strings rasterized |
+|---|---|---|---|---|---|
+| no stress panel | 0.32 | — | 38 | 2.4 | 0 |
+| monospace atlas | 0.51 | +0.19 | 38 | 2.4 | **0** |
+| string cache | 6.84 | +6.52 | 520 | 28.0 (its ceiling) | **43 200** |
+
+Two hundred strings is ~4800 glyphs; through the atlas that is one bind and one
+`glBegin(GL_QUADS)` run per string, and the cache does not move. Through the
+cache it is 216 rasterizations and as many uploads a frame, 20× the frame cost,
+and the cache is pushed to its byte ceiling — which is where the room's signs
+and nameplates used to be. `F2` shows the same thing live, and adds a
+world-space panel in front of the player for the `text_mono_3d` half.
 
 ### Focus, and the alt-tab freeze
 

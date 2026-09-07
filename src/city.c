@@ -418,22 +418,56 @@ int unit_is_code(const Building *b, const Unit *u){
 }
 
 /* which room, if any, currently holds a decoding */
+/* Two rooms may be decoded at once, and only two: the one you are standing
+   in, and the one the wisp is in when it has gone on without you (§8 B3,
+   trimmed to exactly what that needs).  They are usually the same room, in
+   which case only one decoding exists and both slots name it -- so the
+   sharing has to be checked before anything is freed.               */
 static Building *g_openBld;
 static int       g_openRoom = -1;
+static Building *g_wispBld;
+static int       g_wispRoom = -1;
+
+static void room_undecode(Room *r){
+    disasm_free(r->dis);
+    r->dis = NULL;
+    for (int i = 0; i < r->nunits && r->units; i++){
+        disasm_free(r->units[i].dis);
+        r->units[i].dis = NULL;
+    }
+    r->activeUnit = -1;
+}
+
+static int same_room(Building *b1, int r1, Building *b2, int r2){
+    return b1 && b1 == b2 && r1 >= 0 && r1 == r2;
+}
 
 void city_leave_room(City *c){
     (void)c;
-    if (g_openBld && g_openRoom >= 0 && g_openRoom < g_openBld->nrooms){
-        Room *r = &g_openBld->rooms[g_openRoom];
-        disasm_free(r->dis);
-        r->dis = NULL;
-        for (int i = 0; i < r->nunits && r->units; i++){
-            disasm_free(r->units[i].dis);
-            r->units[i].dis = NULL;
-        }
-        r->activeUnit = -1;
-    }
+    if (g_openBld && g_openRoom >= 0 && g_openRoom < g_openBld->nrooms &&
+        !same_room(g_openBld, g_openRoom, g_wispBld, g_wispRoom))
+        room_undecode(&g_openBld->rooms[g_openRoom]);
     g_openBld = NULL; g_openRoom = -1;
+}
+
+/* the room the wisp is in, when it is not the one you are in */
+void city_leave_wisp_room(City *c){
+    (void)c;
+    if (g_wispBld && g_wispRoom >= 0 && g_wispRoom < g_wispBld->nrooms &&
+        !same_room(g_wispBld, g_wispRoom, g_openBld, g_openRoom))
+        room_undecode(&g_wispBld->rooms[g_wispRoom]);
+    g_wispBld = NULL; g_wispRoom = -1;
+}
+
+int city_wisp_room(const City *c, int *bi, int *ri){
+    if (!g_wispBld || g_wispRoom < 0) return 0;
+    for (int i = 0; i < c->nbld; i++)
+        if (&c->bld[i] == g_wispBld){
+            if (bi) *bi = i;
+            if (ri) *ri = g_wispRoom;
+            return 1;
+        }
+    return 0;
 }
 
 /* name the far end of every wire that leaves the room */
@@ -484,6 +518,46 @@ static Disasm *decode(const uint8_t *data, uint64_t datasz, uint64_t size,
     return disasm_run(data, n, addr ? addr : fileoff, MAX_INS_PER_ROOM);
 }
 
+/* decode a room, whichever slot wants it; 1 if there is code there */
+static int room_decode(Building *b, Room *r){
+    if (r->kind == RT_GROUP && r->units){
+        if (r->units[0].dis) return 1;                /* the other slot has it */
+        int any = 0;
+        for (int i = 0; i < r->nunits; i++){
+            Unit *u = &r->units[i];
+            if (!unit_is_code(b, u)) continue;
+            u->dis = decode(u->data, u->datasz, u->size, u->addr, u->fileoff);
+            if (u->dis) any = 1;
+        }
+        if (!any) return 0;
+        chamber_link(r);
+        for (int i = 0; i < r->nunits; i++){
+            disasm_ports(r->units[i].dis);
+            label_ports(b->elf, r->units[i].dis);
+        }
+        return 1;
+    }
+    if (r->dis) return 1;                             /* the other slot has it */
+    if (!room_is_code(b, r)) return 0;
+    r->dis = decode(r->data, r->datasz, r->size, r->addr, r->fileoff);
+    if (!r->dis) return 0;
+    disasm_ports(r->dis);
+    label_ports(b->elf, r->dis);
+    return 1;
+}
+
+/* Where the wisp is when it has gone on without you.  The room you are
+   standing in stays decoded; this is the only other one that ever is. */
+void city_enter_wisp_room(City *c, int bi, int ri){
+    if (bi >= 0 && bi < c->nbld && g_wispBld == &c->bld[bi] && g_wispRoom == ri) return;
+    city_leave_wisp_room(c);
+    if (bi < 0 || bi >= c->nbld) return;
+    Building *b = &c->bld[bi];
+    if (ri < 0 || ri >= b->nrooms) return;
+    if (!room_decode(b, &b->rooms[ri])) return;
+    g_wispBld = b; g_wispRoom = ri;
+}
+
 void city_enter_room(City *c, int bi, int ri){
     if (bi >= 0 && bi < c->nbld && g_openBld == &c->bld[bi] && g_openRoom == ri) return;
     city_leave_room(c);
@@ -492,29 +566,7 @@ void city_enter_room(City *c, int bi, int ri){
     if (ri < 0 || ri >= b->nrooms) return;
     Room *r = &b->rooms[ri];
 
-    if (r->kind == RT_GROUP && r->units){
-        int any = 0;
-        for (int i = 0; i < r->nunits; i++){
-            Unit *u = &r->units[i];
-            if (!unit_is_code(b, u)) continue;
-            u->dis = decode(u->data, u->datasz, u->size, u->addr, u->fileoff);
-            if (u->dis) any = 1;
-        }
-        if (!any) return;
-        chamber_link(r);
-        for (int i = 0; i < r->nunits; i++){
-            disasm_ports(r->units[i].dis);
-            label_ports(b->elf, r->units[i].dis);
-        }
-        g_openBld = b; g_openRoom = ri;
-        return;
-    }
-
-    if (!room_is_code(b, r)) return;
-    r->dis = decode(r->data, r->datasz, r->size, r->addr, r->fileoff);
-    if (!r->dis) return;
-    disasm_ports(r->dis);
-    label_ports(b->elf, r->dis);
+    if (!room_decode(b, r)) return;
     g_openBld = b; g_openRoom = ri;
 }
 

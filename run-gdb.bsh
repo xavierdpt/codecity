@@ -1,0 +1,9 @@
+#!/bin/sh
+# Run codecity under gdb and leave a backtrace behind if it dies.
+# Usage: ./run-gdb.bsh [file]      -> writes crash.log
+exec gdb -q -batch \
+  -ex 'set pagination off' -ex 'set confirm off' \
+  -ex 'set debuginfod enabled off' \
+  -ex run -ex 'echo \n===== IT STOPPED HERE =====\n' \
+  -ex 'bt full' -ex 'info registers' -ex 'info locals' \
+  --args ./codecity "${1:-/bin/ls}" 2>&1 | tee crash.log

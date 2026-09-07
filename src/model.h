@@ -236,6 +236,13 @@ int   room_is_code(const Building *b, const Room *r);
 int   unit_is_code(const Building *b, const Unit *u);
 void  city_enter_room(City *c, int bi, int ri);   /* frees whatever was open */
 void  city_leave_room(City *c);
+/* The one exception to one-room-at-a-time: when a wisp goes on without you,
+   its room is decoded too, and only ever one besides yours (§8 B3, trimmed
+   to what that needs).  If it is the same room as yours, there is still
+   only one decoding and both slots name it.                          */
+void  city_enter_wisp_room(City *c, int bi, int ri);
+void  city_leave_wisp_room(City *c);
+int   city_wisp_room(const City *c, int *bi, int *ri);
 const char *elf_sym_at(const Elf *e, uint64_t addr, uint64_t *off);
 
 /* where an address lives: building, room, and chamber alcove (-1 if the

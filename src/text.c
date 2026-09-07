@@ -35,6 +35,7 @@ static Entry    *g_new, *g_old;         /* most / least recently used */
 static int       g_live;
 static size_t    g_bytes;
 static unsigned  g_frame = 1;
+static unsigned long g_rasters;      /* strings rasterized since start */
 static float     g_right[3] = {1,0,0}, g_up[3] = {0,1,0};
 
 static const struct { const char *path; int size; } FONTS[FNT_COUNT] = {
@@ -47,6 +48,8 @@ static const char *FALLBACK[] = {
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf", NULL
 };
+
+static int mono_build(void);
 
 int text_init(void){
     if (TTF_Init() != 0){ fprintf(stderr, "TTF_Init: %s\n", TTF_GetError()); return 0; }
@@ -63,6 +66,9 @@ int text_init(void){
             g_small[i] = TTF_OpenFont(FALLBACK[k], FONTS[i].size / 2);
         if (g_small[i]) TTF_SetFontHinting(g_small[i], TTF_HINTING_LIGHT);
     }
+    if (!mono_build())
+        fprintf(stderr, "monospace atlas unavailable -- changing text falls "
+                        "back to the string cache\n");
     return 1;
 }
 
@@ -148,6 +154,7 @@ static Entry *get(int font, const char *s){
     for (Entry *e = g_tab[h]; e; e = e->next)
         if (e->font == font && !strcmp(e->key, s)){ touch(e); return e; }
 
+    g_rasters++;
     SDL_Surface *sf = raster(font, s);
     if (!sf) return NULL;
     SDL_Surface *cv = SDL_ConvertSurfaceFormat(sf, SDL_PIXELFORMAT_ABGR8888, 0);
@@ -242,6 +249,164 @@ float text_2d(int font, float x, float y, float px, const char *s){
     return w;
 }
 
+/* ------------------------------------------------------------------ */
+/* the monospace atlas: 95 glyphs rasterized once, drawn as quads      */
+/* ------------------------------------------------------------------ */
+/* The cache above keys on whole strings, which is right for labels that
+   live as long as the room and wrong for a readout that changes every
+   frame: sixteen registers at six steps a second is a hundred TTF
+   rasterizations and a hundred texture uploads a second, and they evict
+   the labels on the way past.  A string whose *content* is new but whose
+   *characters* are not needs no rasterization at all -- one bound texture
+   and one quad per glyph.                                              */
+
+#define MONO_FIRST 32
+#define MONO_LAST  126
+#define MONO_N     (MONO_LAST - MONO_FIRST + 1)
+#define MONO_COLS  16
+#define MONO_ROWS  ((MONO_N + MONO_COLS - 1) / MONO_COLS)
+#define MONO_PAD   2                    /* transparent gutter, so GL_LINEAR
+                                           at the edge of a cell cannot pick
+                                           up the neighbouring glyph      */
+
+static GLuint g_atlas;
+static int    g_cw, g_ch;               /* one cell, in atlas pixels */
+static int    g_aw, g_ah;               /* the whole atlas */
+static float  g_advance = 0.6f;         /* advance / glyph height */
+
+static int mono_build(void){
+    TTF_Font *f = g_font[FNT_MONO];
+    if (!f) return 0;
+    int adv = 0;
+    if (TTF_GlyphMetrics(f, 'M', NULL, NULL, NULL, NULL, &adv) != 0 || adv <= 0){
+        int w, h;
+        adv = (TTF_SizeUTF8(f, "M", &w, &h) == 0 && w > 0) ? w : TTF_FontHeight(f) / 2;
+    }
+    g_cw = adv;
+    g_ch = TTF_FontHeight(f);
+    if (g_cw <= 0 || g_ch <= 0) return 0;
+    g_aw = MONO_COLS * (g_cw + 2 * MONO_PAD);
+    g_ah = MONO_ROWS * (g_ch + 2 * MONO_PAD);
+
+    SDL_Surface *at = SDL_CreateRGBSurfaceWithFormat(0, g_aw, g_ah, 32,
+                                                     SDL_PIXELFORMAT_ABGR8888);
+    if (!at) return 0;
+    SDL_FillRect(at, NULL, 0);
+    SDL_Color white = { 255, 255, 255, 255 };
+    for (int i = 0; i < MONO_N; i++){
+        char s[2] = { (char)(MONO_FIRST + i), 0 };
+        SDL_Surface *g = TTF_RenderUTF8_Blended(f, s, white);
+        if (!g) continue;
+        SDL_SetSurfaceBlendMode(g, SDL_BLENDMODE_NONE);   /* copy, do not blend */
+        SDL_Rect cell = { (i % MONO_COLS) * (g_cw + 2*MONO_PAD) + MONO_PAD,
+                          (i / MONO_COLS) * (g_ch + 2*MONO_PAD) + MONO_PAD,
+                          g_cw, g_ch };
+        SDL_SetClipRect(at, &cell);       /* a glyph wider than the cell is
+                                             clipped rather than spilling  */
+        SDL_Rect dst = cell;
+        SDL_BlitSurface(g, NULL, at, &dst);
+        SDL_FreeSurface(g);
+    }
+    SDL_SetClipRect(at, NULL);
+
+    glGenTextures(1, &g_atlas);
+    glBindTexture(GL_TEXTURE_2D, g_atlas);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, at->pitch / 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, at->w, at->h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, at->pixels);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    SDL_FreeSurface(at);
+    g_advance = (float)g_cw / (float)g_ch;
+    return 1;
+}
+
+int   text_mono_ready(void){ return g_atlas != 0; }
+float text_mono_advance(void){ return g_advance; }
+float text_mono_width(float h, const char *s){
+    return s ? (float)strlen(s) * h * g_advance : 0.0f;
+}
+void text_mono_atlas(int *w, int *h, size_t *bytes){
+    if (w) *w = g_aw;
+    if (h) *h = g_ah;
+    if (bytes) *bytes = (size_t)g_aw * g_ah * 4;
+}
+void text_cache_stats(int *live, size_t *bytes, unsigned long *rasters){
+    if (live)    *live    = g_live;
+    if (bytes)   *bytes   = g_bytes;
+    if (rasters) *rasters = g_rasters;
+}
+
+/* cell of a byte: anything outside printable ASCII -- a UTF-8 lead byte
+   included -- shows as '?' rather than silently vanishing */
+static void mono_cell(unsigned char c, float *u0, float *v0, float *u1, float *v1){
+    if (c == '\t') c = ' ';
+    if (c < MONO_FIRST || c > MONO_LAST) c = '?';
+    int i = c - MONO_FIRST;
+    float x = (float)((i % MONO_COLS) * (g_cw + 2*MONO_PAD) + MONO_PAD);
+    float y = (float)((i / MONO_COLS) * (g_ch + 2*MONO_PAD) + MONO_PAD);
+    *u0 = x / g_aw;             *v0 = y / g_ah;                 /* top-left  */
+    *u1 = (x + g_cw) / g_aw;    *v1 = (y + g_ch) / g_ah;        /* bottom-r. */
+}
+
+void text_mono_2d(float x, float y, float px, const char *s){
+    if (!s || !*s) return;
+    if (!g_atlas){ text_2d(FNT_MONO, x, y, px, s); return; }
+    float w = px * g_advance;
+    glBindTexture(GL_TEXTURE_2D, g_atlas);
+    glBegin(GL_QUADS);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++, x += w){
+        if (*p == ' ' || *p == '\t') continue;
+        float u0, v0, u1, v1;
+        mono_cell(*p, &u0, &v0, &u1, &v1);
+        glTexCoord2f(u0, v0); glVertex2f(x,     y);
+        glTexCoord2f(u1, v0); glVertex2f(x + w, y);
+        glTexCoord2f(u1, v1); glVertex2f(x + w, y + px);
+        glTexCoord2f(u0, v1); glVertex2f(x,     y + px);
+    }
+    glEnd();
+}
+
+void text_mono_3d(const float p[3], const float r[3], const float u[3],
+                  float h, int anchor, const char *s){
+    if (!s || !*s) return;
+    if (!g_atlas){ text_3d(FNT_MONO, p, r, u, h, anchor, s); return; }
+    size_t n = strlen(s);
+    float w = h * g_advance;
+    float total = (float)n * w;
+    float shift = anchor == 1 ? -total * 0.5f : (anchor == 2 ? -total : 0.0f);
+    float o[3] = { p[0] + r[0]*shift, p[1] + r[1]*shift, p[2] + r[2]*shift };
+    glBindTexture(GL_TEXTURE_2D, g_atlas);
+    glEnable(GL_CULL_FACE); glCullFace(GL_BACK); glFrontFace(GL_CCW);
+    glBegin(GL_QUADS);
+    for (size_t i = 0; i < n; i++){
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t') continue;
+        float u0, v0, u1, v1;
+        mono_cell(c, &u0, &v0, &u1, &v1);
+        float a[3], b[3];               /* bottom-left, bottom-right */
+        for (int k = 0; k < 3; k++){
+            a[k] = o[k] + r[k] * ((float)i * w);
+            b[k] = a[k] + r[k] * w;
+        }
+        glTexCoord2f(u0, v1); glVertex3f(a[0], a[1], a[2]);
+        glTexCoord2f(u1, v1); glVertex3f(b[0], b[1], b[2]);
+        glTexCoord2f(u1, v0); glVertex3f(b[0]+u[0]*h, b[1]+u[1]*h, b[2]+u[2]*h);
+        glTexCoord2f(u0, v0); glVertex3f(a[0]+u[0]*h, a[1]+u[1]*h, a[2]+u[2]*h);
+    }
+    glEnd();
+    glDisable(GL_CULL_FACE);
+}
+
+void text_mono_billboard(float x, float y, float z, float h, const char *s){
+    float p[3] = { x, y, z };
+    text_mono_3d(p, g_right, g_up, h, 1, s);
+}
+
 void text_shutdown(void){
     for (int i = 0; i < CACHE_SZ; i++){
         Entry *e = g_tab[i];
@@ -249,6 +414,7 @@ void text_shutdown(void){
         g_tab[i] = NULL;
     }
     g_new = g_old = NULL; g_live = 0; g_bytes = 0;
+    if (g_atlas){ glDeleteTextures(1, &g_atlas); g_atlas = 0; }
     for (int i = 0; i < FNT_COUNT; i++){
         if (g_font[i]) TTF_CloseFont(g_font[i]);
         if (g_small[i]) TTF_CloseFont(g_small[i]);
