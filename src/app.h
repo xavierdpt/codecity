@@ -4,6 +4,7 @@
 #include "world.h"
 
 typedef struct Wisp Wisp;   /* wisp.h; App only ever holds a pointer */
+typedef struct Live Live;   /* live.h; likewise */
 
 #define BR_MAX 4096
 
@@ -38,6 +39,14 @@ typedef struct {
     /* the wisp: a CPU state walking the room you are standing in.  One at a
        time, spawned by `x` and freed when the room's decoding is.       */
     Wisp  *wisp;
+    /* The live session, when there is one (docs/live-wisps.md).  A session
+       is either reading a real process or simulating one and never both:
+       when `live` is set every wisp is a WS_LIVE one, and when it is NULL
+       none can be.  `livePid` is kept beside it only so the HUD can name
+       the process without reaching into live.h.                     */
+    Live  *live;
+    int    livePid;
+    uint64_t liveBias;          /* file address + this = live address */
     int    wispSeed;            /* bumped by `n` for a different run */
     int    keepWisp;            /* a room change the wisp itself asked for */
     /* the wisp is standing at a door with its hand on the handle: pilot

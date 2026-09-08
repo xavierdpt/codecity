@@ -4,7 +4,7 @@
 #include "disasm.h"
 #include "render.h"
 #include "wisp.h"
-#include "wisp.h"
+#include "live.h"
 #include "text.h"
 #include <SDL2/SDL.h>
 #include <GL/gl.h>
@@ -16,7 +16,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static App g_app;
@@ -246,6 +250,15 @@ static Room *code_room_here(App *a){
 }
 
 static void wisp_toggle(App *a){
+    /* One or the other, never both.  A simulated wisp beside a live one
+       would put invented values and measured ones on the same screen, and
+       the whole purpose of the provenance tagging is that the viewer never
+       has to work out which kind of number they are looking at.      */
+    if (a->live && !a->wisp){
+        app_message(a, "a real process is attached -- press L to read its state, "
+                       "not X to invent one");
+        return;
+    }
     if (a->wisp){
         wisp_forget(a);
         app_message(a, "wisp gone");
@@ -260,6 +273,53 @@ static void wisp_toggle(App *a){
     const Insn *in = wisp_insn(a->wisp, r);
     app_message(a, "a wisp starts at 0x%llx  --  k pause, . step, , / speed, n reseed",
                 (unsigned long long)(in ? in->addr : 0));
+}
+
+/* ------------------------------------------------------------------ */
+/* the live wisp (L2)                                                  */
+/* ------------------------------------------------------------------ */
+/* Run the real process to the sculpture you are standing next to, and show
+   what its registers actually are there.  §4.3: a live run should start
+   from a breakpoint the user placed, not from the entry point -- 99.7% of
+   the instructions after the entry are in the loader and libc, which this
+   city has no room for.  Standing in front of an instruction and asking
+   for it is the whole interaction.                                   */
+static void live_here(App *a){
+    if (!a->live){
+        app_message(a, "no live process -- start with --debug PROGRAM");
+        return;
+    }
+    Room *r = code_room_here(a);
+    if (!r){ app_message(a, "no code in this room to stop in"); return; }
+    const Disasm *d = room_dis(r);
+    if (!d || !d->n){ app_message(a, "nothing decoded here"); return; }
+    /* the sculpture under the crosshair, else the first in the room */
+    int idx = (a->nearIns >= 0 && a->nearIns < d->n) ? a->nearIns : 0;
+    uint64_t fa = d->ins[idx].addr, la = file_to_live(a->live, fa);
+    if (!la){ app_message(a, "0x%llx is not mapped in the process",
+                          (unsigned long long)fa); return; }
+
+    app_message(a, "running to 0x%llx ...", (unsigned long long)fa);
+    if (!live_run_to(a->live, la)){
+        app_message(a, "did not get there: %s", live_err(a->live));
+        return;
+    }
+    uint64_t stopped = live_to_file(a->live, live_pc(a->live));
+    if (!stopped){
+        app_message(a, "the process stopped outside this file");
+        return;
+    }
+    Building *b = &a->city->bld[a->p.inside];
+    if (a->wisp) wisp_forget(a);
+    a->wisp = wisp_spawn_live(b, r, a->elf, stopped);
+    if (!a->wisp){ app_message(a, "0x%llx is not decoded in this room",
+                               (unsigned long long)stopped); return; }
+    a->wisp->async = 1;         /* frames are being drawn: never block one */
+    a->wispBi = a->p.inside; a->wispRi = a->p.room; a->wispAway = 0;
+    int n = wisp_live_sync(a->wisp, r, a->live, stopped);
+    a->showState = 1;
+    app_message(a, "stopped at 0x%llx in the real process -- %d registers read",
+                (unsigned long long)stopped, n);
 }
 
 /* Pilot mode: the wisp leads and the player goes with it.  Following a port
@@ -506,11 +566,56 @@ static void wisp_key(App *a, int k){
     if (!r) return;
     switch (k){
     case 0:
+        if (w->src == WS_LIVE && w->waiting){
+            /* an unbounded wait must always be escapable (§6) */
+            live_interrupt(a->live);
+            app_message(a, "interrupting -- taking the process back");
+            break;
+        }
         w->paused = !w->paused;
         if (!w->paused){ w->stepping = 0; w->overCall = 0; }
-        app_message(a, w->paused ? "wisp paused  --  T step over   I step into"
-                                 : "wisp running"); break;
+        if (w->src == WS_LIVE)
+            app_message(a, w->paused ? "live wisp paused  --  T steps one instruction"
+                                     : "live wisp running -- K again to stop, "
+                                       "and to take it back if a call hangs");
+        else
+            app_message(a, w->paused ? "wisp paused  --  T step over   I step into"
+                                     : "wisp running");
+        break;
     case 1: {                                   /* step over */
+        /* A live wisp steps the real CPU.  There is no "over" yet: making
+           a call run whole means breakpointing its return address, which
+           is §4's C2 policy and lands with L4.                       */
+        if (w->src == WS_LIVE){
+            uint64_t gone = 0;
+            if (wisp_step_live(w, r, a->live, &gone)){
+                const Insn *ni = wisp_insn(w, r);
+                app_message(a, "stepped to 0x%llx",
+                            (unsigned long long)(ni ? ni->addr : 0));
+            } else if (w->wants){
+                /* the code went to another room of this same file: follow
+                   it, exactly as pressing E on a port would          */
+                if (wisp_move(a, 1) && a->wisp){
+                    a->wisp->paused = 1;
+                    Room *nr = wisp_room(a);
+                    const Insn *ni = nr ? wisp_insn(a->wisp, nr) : NULL;
+                    app_message(a, "stepped into 0x%llx",
+                                (unsigned long long)(ni ? ni->addr : 0));
+                }
+            } else if (gone){
+                /* §4's C1: say where it went, by name where gdb has one */
+                const LiveMod *mo = live_mod_at(a->live, gone);
+                app_message(a, "%s -- %s%s0x%llx in %s", w->why,
+                            w->wentTo[0] ? w->wentTo : "",
+                            w->wentTo[0] ? ", " : "",
+                            (unsigned long long)gone,
+                            mo ? (strrchr(mo->path,'/') ? strrchr(mo->path,'/')+1
+                                                        : mo->path)
+                               : "no mapped file");
+            } else app_message(a, "%s", w->why);
+            w->t = 0;
+            break;
+        }
         wisp_step_over(w, r);
         w->t = 0;
         if (w->overCall)
@@ -519,6 +624,10 @@ static void wisp_key(App *a, int k){
         else if (w->done) app_message(a, "%s", w->why);
         break; }
     case 5: {                                   /* step into */
+        /* Live, stepping in and stepping over are the same act until the
+           step-over contract of L4 exists: one instruction, wherever it
+           goes.                                                      */
+        if (w->src == WS_LIVE){ wisp_key(a, 1); break; }
         wisp_step_into(w, r);
         w->t = 0;
         if (w->wants){                          /* the callee is another room */
@@ -586,6 +695,7 @@ void app_key(App *a, int k, int shift){
                 app_message(a, "no wisp to show -- press X to start one");
         } else wisp_toggle(a);
         break;
+    case SDLK_l: live_here(a); break;            /* the real process, here */
     case SDLK_k: wisp_key(a, 0); break;          /* §12 asks for Space, which
                                                     is jump here */
     /* Step by step.  Letters, because a keycode for a letter is the same key
@@ -1154,6 +1264,11 @@ static int keyfuzz_selftest(App *a, int frames){
         SDLK_EQUALS,
         SDLK_n, SDLK_TAB, SDLK_m, SDLK_g, SDLK_v, SDLK_r, SDLK_e, SDLK_F1,
         SDLK_LEFTBRACKET, SDLK_RIGHTBRACKET, SDLK_F2, SDLK_o, SDLK_j, SDLK_j,
+        /* L is here so the live path is fuzzed too.  With no process
+           attached it is one message and a return, which is exactly the
+           case worth checking: the key must be harmless when the feature
+           it belongs to was never asked for.                        */
+        SDLK_l,
     };
     const int NK = (int)(sizeof KEYS / sizeof *KEYS);
     unsigned rng = 0x5eed1234u;
@@ -2015,6 +2130,920 @@ static int shot_mode(App *a, const char *dir){
 
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* --maptest: L1's pass criterion, headless                            */
+/* ------------------------------------------------------------------ */
+/* The one thing L1 must get right is that an address in a running process
+   and an address in the file name the same room.  Everything the live wisp
+   will ever do rests on that, and it is cheap to check exactly.        */
+
+static int mt_fail;
+static void mt(int cond, const char *what, ...){
+    va_list ap; va_start(ap, what);
+    char msg[240];
+    vsnprintf(msg, sizeof msg, what, ap);
+    va_end(ap);
+    if (!cond){ printf("  FAIL  %s\n", msg); mt_fail++; }
+    else       printf("  ok    %s\n", msg);
+}
+
+/* the lowest p_vaddr among the PT_LOAD segments: 0 for a typical PIE,
+   0x400000 for a classic ET_EXEC.  The bias is measured from it, so a
+   non-PIE comes out at bias 0 by arithmetic rather than by special case. */
+static uint64_t lowest_load_vaddr(const Elf *e){
+    uint64_t lo = 0; int have = 0;
+    for (int i = 0; i < e->nseg; i++){
+        if (e->seg[i].type != 1 /*PT_LOAD*/) continue;
+        if (!have || e->seg[i].vaddr < lo){ lo = e->seg[i].vaddr; have = 1; }
+    }
+    return have ? lo : 0;
+}
+
+static int maptest(const char *file, const char *prog, int verbose){
+    mt_fail = 0;
+    if (!prog) prog = file;
+    printf("maptest: city from %s, running %s\n", file, prog);
+
+    char err[512];
+    Elf *e = elf_open(file, err, sizeof err);
+    if (!e){ printf("  FAIL  %s: %s\n", file, err); return 1; }
+    disasm_open(e->machine, e->is64, e->be);
+    City *c = city_build(e);
+    if (!c){ printf("  FAIL  could not build the city\n"); elf_close(e); return 1; }
+
+    Live *L = live_launch(prog, NULL, 0, err, sizeof err);
+    if (!L){ printf("  FAIL  %s\n", err); city_free(c); elf_close(e); disasm_close(); return 1; }
+
+    uint64_t low = lowest_load_vaddr(e);
+    int pie = e->etype == 3 /*ET_DYN*/;
+    if (verbose){
+        printf("  %d module%s mapped; %s, lowest PT_LOAD vaddr 0x%llx\n",
+               live_nmods(L), live_nmods(L) == 1 ? "" : "s",
+               pie ? "ET_DYN (PIE or library)" : "ET_EXEC (fixed address)",
+               (unsigned long long)low);
+    }
+    mt(live_nmods(L) > 0, "the inferior's mapped files were read (%d)", live_nmods(L));
+
+    /* A library subject is not mapped at the first stop; let the loader
+       get to it.  Harmless for an executable, which is already there. */
+    if (strcmp(file, prog) && !live_await_module(L, file, 512, err, sizeof err))
+        printf("  note  %s\n", err);
+    if (!live_set_subject(L, file, low, err, sizeof err)){
+        printf("  FAIL  %s\n", err);
+        mt_fail++;
+        goto done;
+    }
+    uint64_t bias = live_bias(L);
+    printf("  ok    %s is mapped; bias 0x%llx\n",
+           strrchr(file, '/') ? strrchr(file, '/') + 1 : file,
+           (unsigned long long)bias);
+    /* A fixed-address executable is loaded where it asked to be, so its
+       bias is zero -- not by a special case, but because the load address
+       and the lowest p_vaddr are the same number.                     */
+    if (!pie) mt(bias == 0, "a non-PIE has no bias");
+    else      mt(bias != 0, "a PIE has one");
+
+    /* the round trip, over every section the city was built from */
+    int roundtrip = 1, offmap = 0;
+    for (int i = 0; i < e->nsec; i++){
+        const Sec *sc = &e->sec[i];
+        if (!(sc->flags & 0x2) || !sc->addr) continue;     /* SHF_ALLOC */
+        uint64_t f = sc->addr, l = file_to_live(L, f);
+        if (!l || live_to_file(L, l) != f) roundtrip = 0;
+    }
+    mt(roundtrip, "every allocated section survives file -> live -> file");
+
+    /* §3's trap, checked rather than trusted: at the first stop the pc is
+       in the loader, so a bias derived from it would be garbage.  The
+       subject's bias must not be what pc - e_entry suggests.          */
+    uint64_t pc0 = live_pc(L);
+    const LiveMod *at0 = live_mod_at(L, pc0);
+    if (verbose)
+        printf("  first stop at 0x%llx in %s\n", (unsigned long long)pc0,
+               at0 ? at0->path : "(no mapped file)");
+    if (pie && at0 && strcmp(at0->path, live_mod(L, live_nmods(L)) ? "" : "")){
+        /* only meaningful when the loader really is a different file */
+        if (strstr(at0->path, "ld-linux") || strstr(at0->path, "ld-musl"))
+            mt(bias != pc0 - e->entry,
+               "the bias is not the one $pc at the first stop would suggest");
+    }
+
+    /* An address in another module is off the map, which is the answer the
+       walker needs (§4) and not an error.  Counted over the *other*
+       modules: the subject's own load base translates to file vaddr 0,
+       which is indistinguishable from the off-map sentinel -- harmless,
+       because 0 is not in any section and city_find_addr() rejects it
+       outright, but it would make this count a lie.                  */
+    int others = 0;
+    for (int i = 0; i < live_nmods(L); i++){
+        const LiveMod *m = live_mod(L, i);
+        if (live_to_file(L, m->lo + (m->hi - m->lo) / 2)) continue;  /* the subject */
+        others++;
+        if (live_to_file(L, m->lo + 8) == 0) offmap++;
+    }
+    mt(offmap == others, "every address in another module reads as off the map (%d)",
+       others);
+
+    /* THE criterion: one address, both ways, lands in the same room.  The
+       entry point is the natural choice for a program -- but a shared
+       library often has e_entry == 0 (libSDL2 does), so fall back to the
+       first executable section, which every file the city draws has. */
+    const Sec *code = NULL;
+    for (int i = 0; i < e->nsec; i++)
+        if ((e->sec[i].flags & 0x4) && e->sec[i].addr && e->sec[i].data &&
+            e->sec[i].datasz >= 64){ code = &e->sec[i]; break; }   /* SHF_EXECINSTR */
+    uint64_t fent = e->entry ? e->entry : (code ? code->addr : 0);
+    const char *what = e->entry ? "entry" : "first code address";
+    uint64_t lent = file_to_live(L, fent);
+    int bi = -1, ri = -1, ui = -1, bi2 = -1, ri2 = -1, ui2 = -1;
+    int f1 = city_find_addr(c, fent, &bi, &ri, &ui);
+    int f2 = city_find_addr(c, live_to_file(L, lent), &bi2, &ri2, &ui2);
+    mt(f1, "the file %s 0x%llx is in a room", what, (unsigned long long)fent);
+    mt(f2 && bi == bi2 && ri == ri2 && ui == ui2,
+       "the live %s 0x%llx maps back to the same room", what,
+       (unsigned long long)lent);
+
+    /* The strong proof, and it does not depend on running anything: read
+       the subject's own code out of the *process* at the translated
+       address and compare it with the bytes in the file.  A bias that is
+       wrong by any amount gives different bytes; a round trip through our
+       own arithmetic would not notice.                               */
+    const Sec *text = code;
+    if (text){
+        uint8_t live_b[64];
+        uint64_t la = file_to_live(L, text->addr);
+        if (live_mem(L, la, 64, live_b))
+            mt(!memcmp(live_b, text->data, 64),
+               "%s in the process matches the file, byte for byte at 0x%llx",
+               text->name, (unsigned long long)la);
+        else
+            mt(0, "could not read %s live: %s", text->name, live_err(L));
+    }
+
+    /* And, when the subject really is the program being run, its entry is
+       an address execution reaches -- so stopping there proves the
+       translation against the CPU.  A library's e_entry is never executed
+       by anyone, so this is not asked of one.                        */
+    if (!strcmp(file, prog)){
+        if (live_run_to(L, lent)){
+            mt(live_pc(L) == lent, "the process stops on that live address");
+            mt(live_to_file(L, live_pc(L)) == fent, "which reads back as the file entry");
+        } else {
+            mt(0, "could not run to the live entry: %s", live_err(L));
+        }
+    } else if (verbose){
+        printf("  note  a library's entry point is never executed, so it is not run to\n");
+    }
+
+done:
+    live_close(L);
+    city_free(c); elf_close(e); disasm_close();
+    printf("maptest: %s\n", mt_fail ? "FAILED" : "ok");
+    return mt_fail ? 1 : 0;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* --steptest: L3's pass criterion, headless                           */
+/* ------------------------------------------------------------------ */
+/* Stepping the real CPU, one instruction at a time, and checking that the
+   city agrees about where we are at every single step.  Also the place the
+   per-step cost is measured, because a step that is cheap in a benchmark
+   and expensive in a frame is no use to anybody.                    */
+
+static int cmp_double(const void *a, const void *b){
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* a named function in the file, so the walk can start somewhere that runs
+   for a while.  §4.3: the entry point is the worst possible place. */
+static uint64_t sym_addr(const Elf *e, const char *name){
+    for (int i = 0; i < e->nsym; i++)
+        if (e->sym[i].name && !strcmp(e->sym[i].name, name) && e->sym[i].value)
+            return e->sym[i].value;
+    return 0;
+}
+
+static int steptest(const char *file, const char *prog, int want, int naive,
+                    int verbose){
+    mt_fail = 0;
+    if (!prog) prog = file;
+    printf("steptest: city from %s, running %s, up to %d steps\n", file, prog, want);
+
+    char err[512];
+    Elf *e = elf_open(file, err, sizeof err);
+    if (!e){ printf("  FAIL  %s: %s\n", file, err); return 1; }
+    disasm_open(e->machine, e->is64, e->be);
+    City *c = city_build(e);
+    Live *L = live_launch(prog, NULL, 0, err, sizeof err);
+    if (!c || !L){
+        printf("  FAIL  %s\n", L ? "could not build the city" : err);
+        if (L) live_close(L);
+        if (c) city_free(c);
+        elf_close(e); disasm_close();
+        return 1;
+    }
+    if (!live_set_subject(L, file, lowest_load_vaddr(e), err, sizeof err)){
+        printf("  FAIL  %s\n", err); mt_fail++; goto done;
+    }
+
+    /* Somewhere that actually runs.  A leaf function is the ideal: no
+       calls, so the walk stays in the file for as long as it likes.   */
+    /* main first: it is the one that calls out of the file, which is what
+       §4's policy is for.  crunch is the leaf that L3 used to measure a
+       per-step cost with nothing in the way.                        */
+    static const char *CAND[] = { "main", "crunch", NULL };
+    uint64_t start_at = 0; const char *startname = "the entry point";
+    for (int i = 0; CAND[i] && !start_at; i++)
+        if ((start_at = sym_addr(e, CAND[i]))) startname = CAND[i];
+    if (!start_at) start_at = e->entry;
+    if (!start_at){ printf("  FAIL  nowhere to start\n"); mt_fail++; goto done; }
+
+    int bi = -1, ri = -1, ui = -1;
+    if (!city_find_addr(c, start_at, &bi, &ri, &ui)){
+        printf("  FAIL  %s (0x%llx) is in no room\n", startname,
+               (unsigned long long)start_at);
+        mt_fail++; goto done;
+    }
+    if (!live_run_to(L, file_to_live(L, start_at))){
+        printf("  FAIL  could not reach %s: %s\n", startname, live_err(L));
+        mt_fail++; goto done;
+    }
+    printf("  ok    stopped in %s at 0x%llx\n", startname,
+           (unsigned long long)start_at);
+
+    city_enter_room(c, bi, ri);
+    Room *r = &c->bld[bi].rooms[ri];
+    Wisp *w = wisp_spawn_live(&c->bld[bi], r, e, start_at);
+    if (!w){ printf("  FAIL  0x%llx is not decoded\n", (unsigned long long)start_at);
+             mt_fail++; goto done; }
+    w->naive = (uint8_t)naive;
+    wisp_live_sync(w, r, L, start_at);
+
+    double *lat = malloc((size_t)want * sizeof *lat);
+    int n = 0, disagree = 0, excursions = 0, rooms = 1, lastover = 0;
+    long offsteps = 0;
+    uint64_t gone = 0;
+    while (n < want){
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int ok = wisp_step_live(w, r, L, &gone);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (!ok){
+            if (w->wants){
+                /* the code went to another room of the same file: go with
+                   it, which is what pilot mode does in the app */
+                int nb = -1, nr = -1, nu = -1;
+                if (!city_find_addr(c, w->wants, &nb, &nr, &nu)) break;
+                city_enter_room(c, nb, nr);
+                Room *nrm = &c->bld[nb].rooms[nr];
+                if (!wisp_rehome(w, nrm, w->wants)) break;
+                wisp_live_sync(w, nrm, L, 0);
+                r = nrm; bi = nb; ri = nr;
+                w->wants = 0;
+                rooms++;
+                continue;
+            }
+            if (!gone) break;                       /* the process ended */
+            /* The wisp parked (§4's C1): it left the file with nowhere to
+               come back to, or left this room.  A call that left and came
+               back was handled inside the step by C2 and never gets here.
+               Walking back one instruction at a time is what L3 did to
+               measure the cost; with C2 in place there is nothing to walk,
+               so a park is the end of this run.                      */
+            excursions++;
+            if (naive){
+                int back = 0;
+                for (long i = 0; i < 400000; i++){
+                    if (!live_step(L)) break;
+                    offsteps++;
+                    uint64_t f = live_to_file(L, live_pc(L));
+                    if (f && wisp_rehome(w, r, f)){
+                        wisp_live_sync(w, r, L, 0);
+                        w->done = 0; w->why[0] = 0;
+                        back = 1; break;
+                    }
+                }
+                if (back) continue;
+            }
+            break;
+        }
+        lat[n++] = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                   (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (verbose && w->nover > lastover){
+            lastover = w->nover;
+            printf("        C2 #%d: ran %s whole, back at 0x%llx\n", w->nover,
+                   w->wentTo[0] ? w->wentTo : "(no symbol)",
+                   (unsigned long long)live_to_file(L, live_pc(L)));
+        }
+
+        /* THE criterion: the city and the process agree, every step */
+        const Insn *in = wisp_insn(w, r);
+        uint64_t fpc = live_to_file(L, live_pc(L));
+        int b2 = -1, r2 = -1, u2 = -1;
+        if (!in || in->addr != fpc || !city_find_addr(c, fpc, &b2, &r2, &u2) ||
+            b2 != bi || r2 != ri){
+            if (disagree < 4)
+                printf("        step %d: pc 0x%llx, sculpture 0x%llx, room %d/%d\n",
+                       n, (unsigned long long)fpc,
+                       (unsigned long long)(in ? in->addr : 0), b2, r2);
+            disagree++;
+        }
+    }
+    mt(disagree == 0, "the city and the process agree at every step");
+    /* §4's accounting, which is the milestone: every instruction the CPU
+       executed is either one the wisp walked, or one inside a call it ran
+       whole and said so.  Nothing is skipped silently.              */
+    printf("  %d steps on the map across %d room%s, %d calls run whole and "
+           "returned (C2), %d parked (C1)\n", n, rooms, rooms == 1 ? "" : "s",
+           w->nover, w->nparked);
+    if (w->nover + w->nparked)
+        printf("  last excursion went to %s\n",
+               w->wentTo[0] ? w->wentTo : "somewhere gdb has no symbol for");
+    if (naive && offsteps)
+        printf("  naive recovery  %ld instructions stepped through to get back, "
+               "%d times\n", offsteps, excursions);
+    {
+        double onmap = (n + offsteps) ? 100.0 * n / (double)(n + offsteps) : 0;
+        if (offsteps) printf("  residency  %.2f%%\n", onmap);
+    }
+    /* Falling short is only a failure when the run stopped for no stated
+       reason.  /bin/ls from its entry does `call __libc_start_main`, which
+       never returns -- eleven steps and a park is the correct and complete
+       answer there, not a shortfall.                                 */
+    if (n < want && w->nparked)
+        printf("  ok    %d steps, then the code left the file for good: %s\n",
+               n, w->why[0] ? w->why : "parked");
+    else
+        mt(n >= want, "%d steps taken", n);
+    if (offsteps)
+        printf("  residency  %.2f%% -- %d steps in this file for every %ld "
+               "outside it.  Walking back one instruction at a time is what\n"
+               "             L4's breakpoint policy has to beat: %d excursions "
+               "at ~%ld instructions each.\n",
+               100.0 * n / (double)(n + offsteps), n, offsteps,
+               excursions, offsteps / (excursions ? excursions : 1));
+
+    if (n){
+        qsort(lat, (size_t)n, sizeof *lat, cmp_double);
+        double p50 = lat[n / 2], p99 = lat[(n * 99) / 100], worst = lat[n - 1];
+        double sum = 0; for (int i = 0; i < n; i++) sum += lat[i];
+        printf("  step cost  median %.3f ms   p99 %.3f ms   worst %.3f ms   "
+               "mean %.3f ms  (%.0f steps/s)\n",
+               p50, p99, worst, sum / n, 1000.0 * n / sum);
+        /* A percentile over a handful of samples is the maximum wearing a
+           different name -- with n = 60, index 99% is index 59.  The
+           budget is only a claim worth making over a real sample.   */
+        if (n >= 1000)
+            mt(p99 <= 2.0, "the 99th percentile step is %.3f ms (budget 2 ms)", p99);
+        else
+            printf("  note  %d samples is too few for a 99th percentile to mean "
+                   "anything; not asserting the budget\n", n);
+    }
+    if (verbose) printf("  %d trail cards, %d rooms\n", w->ntrail, w->nrooms);
+    free(lat);
+    wisp_free(w);
+
+done:
+    live_close(L);
+    if (c) city_free(c);
+    elf_close(e); disasm_close();
+    printf("steptest: %s\n", mt_fail ? "FAILED" : "ok");
+    return mt_fail ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* --statetest: L2's pass criterion, headless                          */
+/* ------------------------------------------------------------------ */
+/* The registers we put on the panel must be the ones gdb reports at the
+   same stop.  Comparing against a separate `gdb -batch -ex "info
+   registers"` run is impossible -- ASLR gives it a different process -- so
+   the differential is inside one session: our parsed MI values against
+   gdb's own human-readable table, at the identical stop.            */
+
+static int statetest(const char *file, const char *prog, int verbose){
+    mt_fail = 0;
+    printf("statetest: city from %s, running %s\n", file, prog);
+
+    char err[512];
+    Elf *e = elf_open(file, err, sizeof err);
+    if (!e){ printf("  FAIL  %s: %s\n", file, err); return 1; }
+    disasm_open(e->machine, e->is64, e->be);
+    City *c = city_build(e);
+    Live *L = live_launch(prog, NULL, 0, err, sizeof err);
+    if (!c || !L){
+        printf("  FAIL  %s\n", L ? "could not build the city" : err);
+        if (L) live_close(L);
+        if (c) city_free(c);
+        elf_close(e); disasm_close();
+        return 1;
+    }
+    if (strcmp(file, prog) && !live_await_module(L, file, 512, err, sizeof err)){
+        /* Ignoring this return replaces the real cause with whatever goes
+           wrong next: the map is left holding what was mapped before the
+           program died, set_subject succeeds against it, and the failure
+           surfaces four steps later as "no registers".              */
+        printf("  FAIL  %s\n", err); mt_fail++; goto done;
+    }
+    if (!live_set_subject(L, file, lowest_load_vaddr(e), err, sizeof err)){
+        printf("  FAIL  %s\n", err); mt_fail++; goto done;
+    }
+
+    /* Stop somewhere in the subject's own code, the way pressing L does:
+       pick a decoded instruction and run the process to it.           */
+    int bi = -1, ri = -1, ui = -1;
+    uint64_t want = e->entry ? e->entry : 0;
+    if (!want || !city_find_addr(c, want, &bi, &ri, &ui)){
+        for (int i = 0; i < e->nsec && !want; i++)
+            if ((e->sec[i].flags & 0x4) && e->sec[i].addr) want = e->sec[i].addr;
+    }
+    if (!city_find_addr(c, want, &bi, &ri, &ui)){
+        printf("  FAIL  0x%llx is in no room\n", (unsigned long long)want);
+        mt_fail++; goto done;
+    }
+    city_enter_room(c, bi, ri);
+    Room *r = &c->bld[bi].rooms[ri];
+
+    /* Getting the process to stop inside the subject is only free when the
+       subject is the program being run.  A library's own code is reached
+       when the program happens to call into it, and finding such a moment
+       is §4's residency problem, not this milestone's -- libc has no
+       .init section to break on and its e_entry is never executed.  So
+       for a library we check the state at whatever stop we have, which is
+       what L2 is actually about, and leave the wisp out of it.       */
+    int in_subject = 0;
+    uint64_t at = 0;
+    if (!strcmp(file, prog)){
+        if (!live_run_to(L, file_to_live(L, want))){
+            printf("  FAIL  could not run to 0x%llx: %s\n",
+                   (unsigned long long)want, live_err(L));
+            mt_fail++; goto done;
+        }
+        at = live_to_file(L, live_pc(L));
+        mt(at == want, "the process is stopped at 0x%llx", (unsigned long long)want);
+        in_subject = at == want;
+    } else {
+        at = live_to_file(L, live_pc(L));
+        printf("  note  stopped at 0x%llx, outside %s -- checking the state there\n",
+               (unsigned long long)live_pc(L),
+               strrchr(file, '/') ? strrchr(file, '/') + 1 : file);
+    }
+    /* A dead inferior has no registers, and saying so once beats four
+       failures that all mean the same thing.  A program that needs a
+       display, or input, or arguments we did not give it, will have run
+       out before we ever look at it.                                 */
+    if (!live_alive(L) || !live_stopped(L)){
+        printf("  FAIL  the process is %s -- there is no state to read\n",
+               live_alive(L) ? "running, not stopped" : "no longer running");
+        mt_fail++; goto done;
+    }
+
+    Wisp *w = wisp_spawn_live(&c->bld[bi], r, e, in_subject ? at : 0);
+    if (!w){ printf("  FAIL  0x%llx is not decoded\n", (unsigned long long)at);
+             mt_fail++; goto done; }
+    mt(w->src == WS_LIVE, "the wisp knows it is live, not simulated");
+    int n = wisp_live_sync(w, r, L, in_subject ? at : 0);
+    mt(n >= 16, "%d registers were read into the state", n);
+
+    /* every value in the state is measured, and says so */
+    int tagged = 0, wrong = 0;
+    for (int i = 0; i < w->vm.nreg; i++){
+        if (w->vm.r[i].prov == PV_NONE) continue;
+        if (w->vm.r[i].prov == PV_LIVE) tagged++;
+        else { wrong++;
+               if (verbose) printf("        %s is %s, not live\n",
+                                   w->vm.rname[i], vm_prov_name(w->vm.r[i].prov)); }
+    }
+    mt(wrong == 0, "every register that has a value is tagged live (%d)", tagged);
+    mt(w->vm.flknown == (1u << VF_COUNT) - 1,
+       "every flag is known -- a real CPU is never unsure");
+
+    /* THE criterion: field for field against gdb's own table */
+    char *table = live_console(L, "info registers");
+    if (!table){ printf("  FAIL  gdb would not print its register table\n");
+                 mt_fail++; wisp_free(w); goto done; }
+    int checked = 0, mismatch = 0;
+    for (char *line = table; line && *line; ){
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char name[32]; unsigned long long v = 0;
+        if (sscanf(line, "%31s %llx", name, &v) == 2){
+            int slot = vm_slot_named(&w->vm, name);
+            if (slot >= 0 && w->vm.r[slot].prov == PV_LIVE){
+                checked++;
+                /* no translation here on purpose: the register file holds
+                   live values verbatim, so this is a raw comparison */
+                if (vm_slot_get(&w->vm, slot) != v){
+                    mismatch++;
+                    printf("        %-8s panel %016llx  gdb %016llx\n", name,
+                           (unsigned long long)vm_slot_get(&w->vm, slot), v);
+                } else if (verbose && checked <= 6){
+                    printf("        %-8s %016llx  agrees\n", name, v);
+                }
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    free(table);
+    mt(checked >= 16, "%d registers were compared against gdb's own table", checked);
+    mt(mismatch == 0, "and every one of them agrees, field for field");
+    wisp_free(w);
+
+done:
+    live_close(L);
+    if (c) city_free(c);
+    elf_close(e); disasm_close();
+    printf("statetest: %s\n", mt_fail ? "FAILED" : "ok");
+    return mt_fail ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* --memtest: L7's pass criterion, headless                            */
+/* ------------------------------------------------------------------ */
+/* The complaint execution-wisps.md §14 apologises hardest for is that
+   `.data` gives its *initial* values, "which for anything mutated at
+   startup is wrong in a way that looks right".  This is that, checked:
+   read a mutated global out of the running process and out of the file,
+   and show that they differ and that the panel knows which is which.  */
+
+static int memtest(const char *file, const char *prog, int verbose){
+    mt_fail = 0;
+    if (!prog) prog = file;
+    printf("memtest: city from %s, running %s\n", file, prog);
+
+    char err[512];
+    Elf *e = elf_open(file, err, sizeof err);
+    if (!e){ printf("  FAIL  %s: %s\n", file, err); return 1; }
+    disasm_open(e->machine, e->is64, e->be);
+    City *c = city_build(e);
+    Live *L = live_launch(prog, NULL, 0, err, sizeof err);
+    if (!c || !L){
+        printf("  FAIL  %s\n", L ? "could not build the city" : err);
+        if (L) live_close(L);
+        if (c) city_free(c);
+        elf_close(e); disasm_close();
+        return 1;
+    }
+    if (!live_set_subject(L, file, lowest_load_vaddr(e), err, sizeof err)){
+        printf("  FAIL  %s\n", err); mt_fail++; goto done;
+    }
+
+    /* stop somewhere after the program has had a chance to change them */
+    uint64_t at = sym_addr(e, "crunch");
+    if (!at) at = sym_addr(e, "main");
+    if (!at || !live_run_to(L, file_to_live(L, at))){
+        printf("  FAIL  could not reach a place where the program has run\n");
+        mt_fail++; goto done;
+    }
+    int bi = -1, ri = -1, ui = -1;
+    if (!city_find_addr(c, at, &bi, &ri, &ui)){
+        printf("  FAIL  0x%llx is in no room\n", (unsigned long long)at);
+        mt_fail++; goto done;
+    }
+    city_enter_room(c, bi, ri);
+    Room *r = &c->bld[bi].rooms[ri];
+    Wisp *w = wisp_spawn_live(&c->bld[bi], r, e, at);
+    if (!w){ printf("  FAIL  0x%llx is not decoded\n", (unsigned long long)at);
+             mt_fail++; goto done; }
+    wisp_live_sync(w, r, L, at);
+
+    /* THE criterion: a global the program changed reads differently out of
+       the process than out of the file, and says which it came from.   */
+    static const char *WANT[] = { "mutated", "counter", NULL };
+    int checked = 0, differed = 0, taggedlive = 0;
+    for (int k = 0; WANT[k]; k++){
+        uint64_t sa = sym_addr(e, WANT[k]);
+        if (!sa) continue;
+        Prov pv = PV_NONE;
+        uint64_t livev = vm_read(&w->vm, sa, 8, &pv);
+        /* the same address straight out of the mapped file */
+        uint64_t filev = 0; int have = 0;
+        for (int i = 0; i < e->nsec; i++){
+            const Sec *sc = &e->sec[i];
+            if (!(sc->flags & 0x2) || !sc->addr || !sc->data) continue;
+            if (sa < sc->addr || sa + 8 > sc->addr + sc->datasz) continue;
+            for (int b = 7; b >= 0; b--)
+                filev = (filev << 8) | sc->data[sa - sc->addr + (uint64_t)b];
+            have = 1; break;
+        }
+        if (!have) continue;
+        checked++;
+        if (livev != filev) differed++;
+        if (pv == PV_LIVE) taggedlive++;
+        printf("  %-8s file %016llx   process %016llx   %s\n", WANT[k],
+               (unsigned long long)filev, (unsigned long long)livev,
+               vm_prov_name(pv));
+    }
+    mt(checked >= 2, "%d initialised globals were read both ways", checked);
+    mt(differed == checked,
+       "every one of them differs -- the file's value is the old one");
+    mt(taggedlive == checked, "and every one is tagged live, not file");
+
+    /* .bss has no bytes in the file at all (§8.4) -- live it has real ones */
+    for (int i = 0; i < e->nsec; i++){
+        if (e->sec[i].type != 8 /*SHT_NOBITS*/ || !e->sec[i].addr) continue;
+        Prov pv = PV_NONE;
+        vm_read(&w->vm, e->sec[i].addr, 8, &pv);
+        mt(pv == PV_LIVE, "%s has real bytes in the process (%s), not invented",
+           e->sec[i].name, vm_prov_name(pv));
+        break;
+    }
+
+    /* the stack the panel draws is the real one now */
+    uint64_t sp = vm_slot_get(&w->vm, w->vm.spSlot >= 0 ? w->vm.spSlot : 0);
+    Prov spv = PV_NONE;
+    uint64_t top = 0;
+    int ok = sp && vm_peek(&w->vm, sp, 8, &top, &spv);
+    mt(ok, "the stack at rsp=0x%llx can be read", (unsigned long long)sp);
+    if (verbose) printf("        [rsp] = %016llx  %s\n",
+                        (unsigned long long)top, vm_prov_name(spv));
+
+    /* §8.4: if invention fires under a live wisp that is worth knowing */
+    uint32_t before = w->vm.nTier0;
+    (void)before;
+    int invented = 0;
+    for (int i = 0; i < VM_MEMLOG && i < w->vm.nmem; i++)
+        if (w->vm.mem[i].prov == PV_INVENTED) invented++;
+    mt(invented == 0, "nothing was invented while a real process was there");
+    wisp_free(w);
+
+done:
+    live_close(L);
+    if (c) city_free(c);
+    elf_close(e); disasm_close();
+    printf("memtest: %s\n", mt_fail ? "FAILED" : "ok");
+    return mt_fail ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* --attachtest: L6's pass criterion, headless                         */
+/* ------------------------------------------------------------------ */
+/* Attaching is mostly a permission story, so most of this is about the
+   refusal being a sentence rather than an errno.  The permitted path is
+   tested against a fixture that opts in with prctl(PR_SET_PTRACER),
+   because on a stock desktop (ptrace_scope = 1) nothing else can be
+   attached to: gdb must be an ancestor, and it never is.            */
+
+static pid_t spawn_fixture(const char *path, const char *arg){
+    pid_t p = fork();
+    if (p == 0){
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0){ dup2(devnull, STDOUT_FILENO); close(devnull); }
+        execl(path, path, arg, (char *)NULL);
+        _exit(127);
+    }
+    return p;
+}
+
+static int attachtest(const char *file, int verbose){
+    mt_fail = 0;
+    int scope = live_ptrace_scope();
+    printf("attachtest: %s, ptrace_scope %d\n", file, scope);
+
+    char err[LIVE_ERRLEN];
+    /* 1. a pid that is not there at all */
+    Live *L = live_attach(0x7ffffff, err, sizeof err);
+    mt(L == NULL && strstr(err, "no process") != NULL,
+       "a pid that does not exist is refused by name -- %s", err);
+    live_close(L);
+
+    /* 2. a process that did not opt in.  Under scope 1 this must be
+          refused, and the message must say what to do about it.      */
+    pid_t shy = spawn_fixture("tests/attachable", "no");
+    if (shy > 0){
+        struct timespec ts = { 0, 300 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        err[0] = 0;
+        L = live_attach((int)shy, err, sizeof err);
+        if (scope >= 1){
+            mt(L == NULL, "a process that did not opt in is refused");
+            mt(strstr(err, "ptrace_scope") != NULL,
+               "and the refusal names ptrace_scope and a way through");
+            if (verbose) printf("        %s\n", err);
+        } else {
+            mt(L != NULL, "with ptrace_scope 0, any owned process attaches");
+        }
+        live_close(L);
+        kill(shy, SIGKILL); waitpid(shy, NULL, 0);
+    }
+
+    /* 3. the permitted path */
+    pid_t ok = spawn_fixture("tests/attachable", "yes");
+    if (ok <= 0){ printf("  FAIL  could not start tests/attachable\n");
+                  return 1; }
+    struct timespec ts = { 0, 400 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    err[0] = 0;
+    L = live_attach((int)ok, err, sizeof err);
+    if (!L){
+        printf("  FAIL  %s\n", err);
+        mt_fail++;
+        kill(ok, SIGKILL); waitpid(ok, NULL, 0);
+        printf("attachtest: FAILED\n");
+        return 1;
+    }
+    mt(1, "attached to pid %d", (int)ok);
+    mt(live_inferior_pid(L) == ok, "and it is the process we asked for");
+    mt(live_stopped(L), "the attach stopped it, wherever it was");
+
+    LiveReg r[LIVE_MAXREG];
+    int nr = live_regs(L, r, LIVE_MAXREG);
+    mt(nr >= 16, "%d registers read out of a process we did not start", nr);
+    if (verbose){
+        char sym[80];
+        live_symbol_at(L, live_pc(L), sym, sizeof sym);
+        const LiveMod *m = live_mod_at(L, live_pc(L));
+        printf("        stopped at 0x%llx%s%s%s%s\n",
+               (unsigned long long)live_pc(L),
+               sym[0] ? " in " : "", sym[0] ? sym : "",
+               m ? ", " : "", m ? m->path : "");
+    }
+    mt(live_nmods(L) > 0, "and its module map was read (%d files)",
+       live_nmods(L));
+
+    /* 4. THE thing that must never go wrong: detaching leaves it running */
+    live_close(L);
+    struct timespec ts2 = { 0, 200 * 1000 * 1000 };
+    nanosleep(&ts2, NULL);
+    int gone = (kill(ok, 0) != 0 && errno == ESRCH);
+    mt(!gone, "and it is still running after we let go -- an attached "
+              "process is not ours to kill");
+    /* a stopped-but-alive process would be just as wrong as a dead one */
+    char st[64] = "", path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)ok);
+    FILE *f = fopen(path, "r");
+    if (f){
+        int dummy; char comm[64], state = 0;
+        if (fscanf(f, "%d %63s %c", &dummy, comm, &state) == 3)
+            snprintf(st, sizeof st, "%c", state);
+        fclose(f);
+    }
+    mt(st[0] != 'T' && st[0] != 't',
+       "and running, not left stopped (state %s)", st[0] ? st : "?");
+    kill(ok, SIGKILL); waitpid(ok, NULL, 0);
+
+    printf("attachtest: %s\n", mt_fail ? "FAILED" : "ok");
+    return mt_fail ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* --runtest: L5's pass criterion                                      */
+/* ------------------------------------------------------------------ */
+/* A live wisp running at its own rate through the real frame loop.  What
+   is being checked is not that it steps -- L3 did that -- but that the
+   frame never waits: a call out of the file is let go of and collected
+   later, so no frame carries the cost of whatever libc decided to do. */
+
+static int runtest(App *a, int frames){
+    if (!a->live){
+        printf("runtest: needs a live process -- give --debug PROGRAM\n");
+        return 1;
+    }
+    mt_fail = 0;
+    printf("runtest: %d frames at %.0f instructions/s\n", frames, WISP_RATE_MAX);
+
+    /* start where the code actually runs, as pressing L does */
+    uint64_t at = sym_addr(a->elf, "main");
+    if (!at) at = a->elf->entry;
+    int bi = -1, ri = -1, ui = -1;
+    if (!at || !city_find_addr(a->city, at, &bi, &ri, &ui)){
+        printf("  FAIL  nowhere to start\n"); return 1;
+    }
+    if (!live_run_to(a->live, file_to_live(a->live, at))){
+        printf("  FAIL  could not reach 0x%llx: %s\n",
+               (unsigned long long)at, live_err(a->live));
+        return 1;
+    }
+    teleport_addr(a, at, NULL);
+    Room *r = code_room_here(a);
+    if (!r){ printf("  FAIL  0x%llx is in no code room\n",
+                    (unsigned long long)at); return 1; }
+    a->wisp = wisp_spawn_live(&a->city->bld[a->p.inside], r, a->elf, at);
+    if (!a->wisp){ printf("  FAIL  0x%llx is not decoded\n",
+                          (unsigned long long)at); return 1; }
+    a->wispBi = a->p.inside; a->wispRi = a->p.room; a->wispAway = 0;
+    wisp_live_sync(a->wisp, r, a->live, at);
+    a->wisp->async = 1;
+    a->wisp->rate = WISP_RATE_MAX;
+    a->wisp->paused = 0; a->wisp->stepping = 0;
+    a->showState = 1; a->showDetail = 1;
+
+    /* "60 fps held" only means anything against what this machine does
+       with no wisp at all: the frame is mostly GL, and a headless context
+       is not a fast one.  So measure the same loop twice.           */
+    const float dt = 1.0f / 60.0f;
+    double baseWorst = 0, baseTotal = 0;
+    int basen = frames / 4 < 120 ? 120 : frames / 4;
+    for (int f = 0; f < basen; f++){
+        struct timespec b0, b1;
+        clock_gettime(CLOCK_MONOTONIC, &b0);
+        a->now += dt;
+        if (a->p.inside >= 0) floor_realize(&a->city->bld[a->p.inside], a->p.floor);
+        room_lifecycle(a);
+        update_prompt(a);
+        render_scene(a);
+        hud_draw(a);
+        clock_gettime(CLOCK_MONOTONIC, &b1);
+        double ms = (b1.tv_sec - b0.tv_sec) * 1000.0 +
+                    (b1.tv_nsec - b0.tv_nsec) / 1e6;
+        if (ms > baseWorst) baseWorst = ms;
+        baseTotal += ms;
+    }
+    printf("  baseline (no wisp)  worst %.3f ms   mean %.3f ms over %d frames\n",
+           baseWorst, baseTotal / basen, basen);
+
+    double worst = 0, total = 0, worstFrame = 0, totalFrame = 0;
+    int nsteps0 = a->wisp->nsteps, waited = 0, longest = 0, run = 0, restarts = 0;
+    int worstAt = -1, took0 = -1, nover = 0, nparked = 0;
+    double first = 0;
+    for (int f = 0; f < frames; f++){
+        struct timespec f0, g0, g1, f1;
+        clock_gettime(CLOCK_MONOTONIC, &f0);
+        a->now += dt;
+        if (a->p.inside >= 0) floor_realize(&a->city->bld[a->p.inside], a->p.floor);
+        room_lifecycle(a);
+
+        clock_gettime(CLOCK_MONOTONIC, &g0);
+        if (a->wisp){
+            Room *wr = wisp_room(a);
+            if (wr) wisp_tick_live(a->wisp, wr, a->live, dt);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &g1);
+
+        if (a->wisp && a->wisp->waiting){ waited++; run++;
+                                          if (run > longest) longest = run; }
+        else run = 0;
+        if (a->wisp && a->wisp->wants) wisp_move(a, 1);
+        update_prompt(a);
+        render_scene(a);
+        hud_draw(a);
+        clock_gettime(CLOCK_MONOTONIC, &f1);
+
+        double gms = (g1.tv_sec - g0.tv_sec) * 1000.0 +
+                     (g1.tv_nsec - g0.tv_nsec) / 1e6;
+        double fms = (f1.tv_sec - f0.tv_sec) * 1000.0 +
+                     (f1.tv_nsec - f0.tv_nsec) / 1e6;
+        /* The first step a live wisp takes costs several milliseconds:
+           gdb has to set up its single-step machinery after a stop that
+           came from a continue.  It happens once when you press K, not
+           once a frame, so it is reported on its own rather than left to
+           dominate a worst-case that is otherwise steady.            */
+        if (took0 < 0 && a->wisp && a->wisp->nsteps > nsteps0){
+            took0 = 1; first = gms;
+        } else if (took0 > 0 && gms > worst){ worst = gms; worstAt = f; }
+        if (fms > worstFrame) worstFrame = fms;
+        total += gms;
+        totalFrame += fms;
+
+        if (a->wisp && a->wisp->done && restarts < 8){
+            /* it left the file for good; start it again where it runs */
+            nover += a->wisp->nover; nparked += a->wisp->nparked;
+            wisp_forget(a);
+            if (live_run_to(a->live, file_to_live(a->live, at))){
+                teleport_addr(a, at, NULL);
+                Room *nr = code_room_here(a);
+                if (nr && (a->wisp = wisp_spawn_live(&a->city->bld[a->p.inside], nr, a->elf, at))){
+                    a->wispBi = a->p.inside; a->wispRi = a->p.room;
+                    wisp_live_sync(a->wisp, nr, a->live, at);
+                    a->wisp->async = 1; a->wisp->rate = WISP_RATE_MAX;
+                    a->wisp->paused = 0; a->wisp->stepping = 0;
+                }
+            }
+            restarts++;
+        }
+    }
+    int took = a->wisp ? a->wisp->nsteps - nsteps0 : 0;
+    if (a->wisp){ nover += a->wisp->nover; nparked += a->wisp->nparked; }
+    printf("  %d steps over %d frames, %d frames spent waiting for a call "
+           "(longest run %d), %d restarts\n", took, frames, waited, longest,
+           restarts);
+    printf("  %d calls out of the file were let go of and collected later, "
+           "%d parked\n", nover, nparked);
+    printf("  gdb per frame  first step %.3f ms (one-off);   after that worst "
+           "%.3f ms (frame %d), mean %.3f ms\n", first, worst, worstAt,
+           total / frames);
+    printf("  whole frame with the wisp  worst %.3f ms   mean %.3f ms\n",
+           worstFrame, totalFrame / frames);
+    mt(took > 0, "the wisp actually ran (%d steps)", took);
+    /* THE criterion: no frame carries the cost of whatever the callee did */
+    mt(worst <= 3.0, "no frame spent more than 3 ms in gdb (worst %.3f)", worst);
+    mt(first <= 16.6, "and the one-off first step (%.3f ms) still fits a frame",
+       first);
+    /* THE third clause: the wisp must not be what costs the frame.  A
+       whole-frame number on its own says more about this machine's GL
+       than about anything here, so it is judged against the same loop
+       with no wisp in it.                                            */
+    mt(worstFrame <= baseWorst + 3.0,
+       "the wisp adds no more than 3 ms to the worst frame (%.3f vs %.3f "
+       "baseline)", worstFrame, baseWorst);
+    mt(total / frames <= baseTotal / basen + 1.0,
+       "and no more than 1 ms to the mean (%.3f vs %.3f)",
+       totalFrame / frames, baseTotal / basen);
+    printf("runtest: %s\n", mt_fail ? "FAILED" : "ok");
+    return mt_fail ? 1 : 0;
+}
+
 int main(int argc, char **argv){
     App *a = &g_app;
     a->winw = 1440; a->winh = 900;
@@ -2024,6 +3053,10 @@ int main(int argc, char **argv){
 
     const char *start = NULL, *shotdir = NULL;
     int dotest = 0, dobench = 0, dostats = 0, gpudebug = 0, dotext = 0, dovm = 0;
+    int dogdb = 0, gdbcycles = 20, domap = 0, dostate = 0;
+    int dostep = 0, stepcount = 10000, stepnaive = 0;
+    int dorun = 0, runframes = 1800, doattach = 0, attachpid = 0, domem = 0;
+    const char *mapprog = NULL, *debugprog = NULL;
     int verbose = 0;
     for (int i = 1; i < argc; i++){
         if (!strcmp(argv[i], "--shot") && i + 1 < argc){ shotdir = argv[++i]; continue; }
@@ -2031,6 +3064,49 @@ int main(int argc, char **argv){
         if (!strcmp(argv[i], "--bench")){ dobench = 1; continue; }
         if (!strcmp(argv[i], "--textbench")){ dotext = 1; continue; }
         if (!strcmp(argv[i], "--vmtest")){ dovm = 1; continue; }
+        if (!strcmp(argv[i], "--gdbtest")){
+            dogdb = 1;
+            /* an optional cycle count: 20 is a quick check, 1000 is the
+               soak docs/live-wisps.md L0 asks for (~2 minutes)        */
+            if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9')
+                gdbcycles = atoi(argv[++i]);
+            continue;
+        }
+        if (!strcmp(argv[i], "--debug")){
+            /* §11: the only way into a live session is the argument vector.
+               No key inside the app starts a process, the file browser
+               cannot, and no environment variable can.  A program run here
+               was named by the user with the same deliberateness as
+               typing `gdb`.                                          */
+            debugprog = (i + 1 < argc && argv[i+1][0] != '-') ? argv[++i] : "";
+            continue;
+        }
+        if (!strcmp(argv[i], "--statetest")){ dostate = 1; continue; }
+        if (!strcmp(argv[i], "--attachtest")){ doattach = 1; continue; }
+        if (!strcmp(argv[i], "--memtest")){ domem = 1; continue; }
+        if (!strcmp(argv[i], "--attach") && i + 1 < argc){
+            attachpid = atoi(argv[++i]); continue;
+        }
+        if (!strcmp(argv[i], "--naive")){ stepnaive = 1; continue; }
+        if (!strcmp(argv[i], "--runtest")){
+            dorun = 1;
+            if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9')
+                runframes = atoi(argv[++i]);
+            continue;
+        }
+        if (!strcmp(argv[i], "--steptest")){
+            dostep = 1;
+            if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9')
+                stepcount = atoi(argv[++i]);
+            continue;
+        }
+        if (!strcmp(argv[i], "--maptest")){
+            domap = 1;
+            /* the program to run, when it is not the file being explored --
+               that is how a library gets tested (docs/live-wisps.md L1) */
+            if (i + 1 < argc && argv[i+1][0] != '-') mapprog = argv[++i];
+            continue;
+        }
         if (!strcmp(argv[i], "-v")){ verbose = 1; continue; }
         if (!strcmp(argv[i], "--cpu") && i + 1 < argc){
             if (!vm_cpu_set(argv[++i])){
@@ -2056,6 +3132,39 @@ int main(int argc, char **argv){
                    "  --selftest    headless check that every tower can be entered and climbed\n"
                    "  --vmtest      run a wisp in every code room of the first code towers and\n"
                    "                report where the runs got to\n"
+                   "  --gdbtest [N] headless check of the gdb transport: N launch/step/kill\n"
+                   "                cycles (default 20) plus the abort paths, asserting that\n"
+                   "                nothing is left running.  Needs gdb; nothing else does\n"
+                   "  --attach PID  explore FILE while an already-running process is looked\n"
+                   "                at.  It is left running when you quit.  Usually refused:\n"
+                   "                ptrace_scope is 1 on most desktops, and the message says\n"
+                   "                which of the three ways through applies\n"
+                   "  --memtest     headless check that memory is read from the process: a\n"
+                   "                global the program changed must not still show the value\n"
+                   "                the file was built with\n"
+                   "  --attachtest  headless check of that, including that a detached process\n"
+                   "                is still running afterwards\n"
+                   "  --debug [P]   explore FILE while a real process runs under gdb: press L\n"
+                   "                in a code room to stop the process on the instruction you\n"
+                   "                are standing next to and read its actual registers.  P is\n"
+                   "                the program to run when it is not FILE itself.  This runs\n"
+                   "                the program -- it is the same act as running it yourself\n"
+                   "  --statetest   headless check that the registers we show are the ones gdb\n"
+                   "                reports, field for field, at the same stop\n"
+                   "  --steptest [N] step the real CPU N times (default 10000) and check the\n"
+                   "                city agrees where we are at every step; reports the cost\n"
+                   "                per step.  Best on tests/workload, which has a leaf loop\n"
+                   "  --runtest [N] with --debug: let a live wisp run at full rate for N frames\n"
+                   "                (default 1800) of the real loop, and report how much of\n"
+                   "                each frame went into gdb.  The frame must never wait\n"
+                   "  --naive       with --steptest: turn off the step-over policy, so a call\n"
+                   "                out of the file is walked through one instruction at a\n"
+                   "                time.  Slow on purpose -- it measures what the policy is\n"
+                   "                worth\n"
+                   "  --maptest [P] headless check that a live address and a file address name\n"
+                   "                the same room: runs P (default: the file itself) under gdb\n"
+                   "                and maps its entry point back through the city.  Give P to\n"
+                   "                explore a library and run something that loads it\n"
                    "  --cpu NAME    the CPU a wisp's `cpuid` answers as: baseline (the\n"
                    "                default, SSE2 only), v2, v3 (AVX2), or host.  A codec\n"
                    "                dispatches on this, so it decides which kernel the wisp\n"
@@ -2097,6 +3206,21 @@ int main(int argc, char **argv){
                    fprintf(stderr, "gpu debug: %s=%s\n", ENV[i].k, ENV[i].v); }
         }
     }
+
+
+    /* The transport test needs no window, no ELF and no city -- that is
+       most of the point of it (docs/live-wisps.md L0), so it runs before
+       any of them exist.                                             */
+    if (dogdb) return live_gdbtest(start, gdbcycles, verbose);
+
+    if (doattach) return attachtest(start, verbose);
+    if (domem) return memtest(start, (debugprog && *debugprog) ? debugprog : start,
+                              verbose);
+    if (domap) return maptest(start, mapprog, verbose);
+    if (dostate) return statetest(start, (debugprog && *debugprog) ? debugprog : start,
+                                  verbose);
+    if (dostep) return steptest(start, (debugprog && *debugprog) ? debugprog : start,
+                                stepcount, stepnaive, verbose);
 
     if (dostats){
         char err[256];
@@ -2278,6 +3402,39 @@ int main(int argc, char **argv){
     a->bfiltered = malloc(BR_MAX * sizeof(int));
     snprintf(a->bdir, sizeof a->bdir, "/usr/bin");
 
+    /* The live session, if one was asked for on the command line.  A
+       failure here is not fatal: the city is perfectly usable without a
+       process behind it, and saying so beats refusing to start.      */
+    if (debugprog || attachpid){
+        const char *runme = debugprog && *debugprog ? debugprog : start;
+        char lerr[512];
+        if (attachpid){
+            a->live = live_attach(attachpid, lerr, sizeof lerr);
+            runme = "the attached process";
+        } else {
+            a->live = live_launch(runme, NULL, 0, lerr, sizeof lerr);
+        }
+        if (!a->live){
+            fprintf(stderr, "%s: %s\n", attachpid ? "--attach" : "--debug", lerr);
+        } else {
+            if (!attachpid && strcmp(start, runme) &&
+                !live_await_module(a->live, start, 512, lerr, sizeof lerr))
+                fprintf(stderr, "--debug: %s\n", lerr);
+            if (!live_set_subject(a->live, start, lowest_load_vaddr(a->elf),
+                                  lerr, sizeof lerr)){
+                fprintf(stderr, "--debug: %s\n", lerr);
+                live_close(a->live); a->live = NULL;
+            } else {
+                a->livePid  = (int)live_inferior_pid(a->live);
+                a->liveBias = live_bias(a->live);
+                fprintf(stderr, "%s: %s is pid %d, %s mapped at bias 0x%llx\n",
+                        attachpid ? "--attach" : "--debug",
+                        runme, a->livePid, a->elf->base,
+                        (unsigned long long)a->liveBias);
+            }
+        }
+    }
+
     if (dobench){
         City *c = a->city;
         int bi = find_bld(a, ".text"); if (bi < 0) bi = 0;
@@ -2320,6 +3477,7 @@ int main(int argc, char **argv){
             wisp_free(a->wisp); a->wisp = NULL;
         }
         city_leave_room(c);
+        live_close(a->live); a->live = NULL;
         render_set_city(NULL); city_free(a->city); elf_close(a->elf); disasm_close();
         text_shutdown(); SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
         return 0;
@@ -2359,6 +3517,7 @@ int main(int argc, char **argv){
         printf("\n%d strings a frame, none of them ever repeated; the first row is\n"
                "the same frame without them, at %.0f fps.\n", N, base);
         a->stress = 0;
+        live_close(a->live); a->live = NULL;
         render_set_city(NULL); city_free(a->city); elf_close(a->elf); disasm_close();
         text_shutdown(); SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
         return 0;
@@ -2366,7 +3525,15 @@ int main(int argc, char **argv){
     if (dovm){
         int rc = vmtest(a, 8, verbose);
         wisp_free(a->wisp); a->wisp = NULL;
+        live_close(a->live); a->live = NULL;
         render_set_city(NULL); city_free(a->city); elf_close(a->elf); disasm_close();
+        text_shutdown(); SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
+        return rc;
+    }
+    if (dorun){
+        int rc = runtest(a, runframes);
+        live_close(a->live); a->live = NULL;
+        render_set_city(NULL); city_free(a->city); elf_close(a->elf);
         text_shutdown(); SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
         return rc;
     }
@@ -2475,6 +3642,16 @@ int main(int argc, char **argv){
                     else running = 0;
                     break;
                 case SDLK_f:
+                    /* The live session is a pairing of one city with one
+                       process; loading another file would leave the bias
+                       and every live address pointing at the wrong thing.
+                       (It is also the rule of §11 that the browser must
+                       never be a way into running something.)         */
+                    if (a->live){
+                        app_message(a, "the browser is off while a process is "
+                                       "attached -- restart to explore another file");
+                        break;
+                    }
                     a->showBrowser = 1; a->showHelp = 0;
                     SDL_SetRelativeMouseMode(SDL_FALSE); mouseLook = 0;
                     SDL_StartTextInput();
@@ -2521,7 +3698,13 @@ int main(int argc, char **argv){
         room_lifecycle(a);
         if (a->wisp){
             Room *wr = wisp_room(a);
-            if (wr) wisp_tick(a->wisp, wr, dt);
+            /* A live wisp is driven by the process, not by arithmetic, and
+               the frame must never wait on it: wisp_tick_live() takes at
+               most one step and returns, and a call it let go of is
+               collected in whatever later frame the answer arrives.   */
+            if (wr && a->wisp->src == WS_LIVE)
+                wisp_tick_live(a->wisp, wr, a->live, dt);
+            else if (wr) wisp_tick(a->wisp, wr, dt);
             if (a->wisp->wants && !a->wisp->asked) wisp_ask(a);
         }
         if (!a->wisp && a->wispAsk[0]){ a->wispAsk[0] = 0; a->wispAskKind = 0; }
@@ -2545,6 +3728,7 @@ int main(int argc, char **argv){
     for (int i = 0; i < a->nbent; i++) free(a->bent[i]);
     free(a->bfiltered);
     wisp_free(a->wisp); a->wisp = NULL;
+    live_close(a->live); a->live = NULL;
     render_set_city(NULL);
     city_free(a->city);
     elf_close(a->elf);

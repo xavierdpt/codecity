@@ -6,7 +6,7 @@ CFLAGS  += -Wall -Wextra -std=c11 -Isrc $(shell pkg-config --cflags $(PKGS))
 LDLIBS   = $(shell pkg-config --libs $(PKGS)) -lm
 
 SRC = src/elfload.c src/ehframe.c src/disasm.c src/city.c src/world.c src/text.c \
-      src/vm.c src/vmcpu.c src/vmx86.c src/vmsimd.c src/vmcheck.c src/wisp.c src/render.c src/hud.c src/main.c
+      src/live.c src/vm.c src/vmcpu.c src/vmx86.c src/vmsimd.c src/vmcheck.c src/wisp.c src/render.c src/hud.c src/main.c
 OBJ = $(SRC:.c=.o)
 BIN = codecity
 
@@ -16,7 +16,7 @@ $(BIN): $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDLIBS)
 
 $(OBJ): src/model.h src/world.h src/app.h src/render.h src/text.h src/disasm.h \
-        src/vm.h src/wisp.h
+        src/vm.h src/wisp.h src/live.h
 
 clean:
 	rm -f $(OBJ) $(BIN)

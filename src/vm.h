@@ -24,7 +24,13 @@
 
 /* where a value came from -- the honesty mechanism.  The failure mode of
    this whole feature is a viewer who believes the numbers.            */
-typedef enum { PV_NONE, PV_INVENTED, PV_FILE, PV_DERIVED, PV_CALL } Prov;
+/* PV_LIVE is measured rather than reasoned: read out of a real process
+   stopped under gdb (docs/live-wisps.md).  A session is either live or
+   simulated and never both, so PV_LIVE never appears beside PV_INVENTED
+   in the same state -- but the panel still names it, because the whole
+   point of Prov is that the viewer can tell which kind of run they are
+   looking at without having to remember how it was started.        */
+typedef enum { PV_NONE, PV_INVENTED, PV_FILE, PV_DERIVED, PV_CALL, PV_LIVE } Prov;
 
 typedef enum { ST_FALL, ST_TAKEN, ST_NOT_TAKEN, ST_CALL_OVER, ST_CALL_INTO,
                ST_EXIT_PORT, ST_RET, ST_STOP } StepKind;
@@ -116,6 +122,13 @@ typedef struct {
     uint64_t  mintHint;
     int       mintHintOn;
     const Elf *elf;
+    /* L7: the fourth memory layer.  A live wisp answers a read from the
+       process itself, above the file and above invention.  It is a
+       callback rather than a Live* so vm.c stays what it is -- a machine
+       that knows nothing about debuggers.  NULL for a simulated run, and
+       then the layers are exactly the three they always were.       */
+    int  (*liveread)(void *ctx, uint64_t addr, int n, uint8_t *out);
+    void  *livectx;
 
     uint32_t  steps;
     int       fuel;

@@ -72,8 +72,8 @@ uint64_t vm_mint(Vm *m){
 }
 
 const char *vm_prov_name(int p){
-    static const char *n[] = { "", "invented", "file", "derived", "call" };
-    return (p >= 0 && p <= PV_CALL) ? n[p] : "";
+    static const char *n[] = { "", "invented", "file", "derived", "call", "live" };
+    return (p >= 0 && p <= PV_LIVE) ? n[p] : "";
 }
 
 /* ------------------------------------------------------------------ */
@@ -407,6 +407,16 @@ static int file_byte(const Vm *m, uint64_t a, uint8_t *out){
     return 0;
 }
 
+/* layer 1.5: the live process, when there is one.  Above the file,
+   because a running program's .data is what it *is* rather than what it
+   started as, and above invention because a real address has a real
+   value.  §8.4: if invention ever fires under a live wisp, that is worth
+   knowing about rather than silently papering over.               */
+static int live_byte(const Vm *m, uint64_t a, uint8_t *out){
+    if (!m->liveread) return 0;
+    return m->liveread(m->livectx, a, 1, out);
+}
+
 static uint64_t assemble(const Vm *m, const uint8_t *b, int n){
     uint64_t v = 0;
     if (m->elf && m->elf->be) for (int i = 0; i < n; i++) v = (v << 8) | b[i];
@@ -418,15 +428,25 @@ int vm_peek(const Vm *m, uint64_t a, int n, uint64_t *v, Prov *pr){
     if (n < 1 || n > 8) return 0;
     uint8_t b[8];
     Prov worst = PV_FILE;
+    int live = 0;
     for (int i = 0; i < n; i++){
-        if (shadow_byte(m, a + (uint64_t)i, &b[i])) continue;
-        if (file_byte(m, a + (uint64_t)i, &b[i])){ continue; }
+        uint64_t at = a + (uint64_t)i;
+        /* The process outranks the shadow.  The shadow holds what a
+           *simulated* run wrote -- the fake stack, the minted canary, the
+           relocations vm_relocs() applied -- and none of that is more
+           authoritative than the memory of a program that is actually
+           running.  A live wisp makes no writes of its own, so there is
+           nothing of its own to lose by looking past it.            */
+        if (live_byte(m, at, &b[i])){ live = 1; continue; }
+        if (shadow_byte(m, at, &b[i])) continue;
+        if (file_byte(m, at, &b[i])){ continue; }
         return 0;
     }
+    if (live) worst = PV_LIVE;
     /* a byte that came out of the shadow may itself have been invented --
        the shadow does not remember which, so peek reports the weaker of
        the two.  vm_read is the call that tags a value properly.       */
-    if (page_find(m, a & ~0xfffull)) worst = PV_DERIVED;
+    if (!m->liveread && page_find(m, a & ~0xfffull)) worst = PV_DERIVED;
     if (v) *v = assemble(m, b, n);
     if (pr) *pr = worst;
     return 1;
@@ -445,9 +465,11 @@ uint64_t vm_read(Vm *m, uint64_t a, int n, Prov *pr){
     uint8_t b[8];
     /* PV_FILE only when every byte really came out of the mapped image;
        one invented byte makes the whole value invented */
-    Prov p = page_find(m, a & ~0xfffull) ? PV_DERIVED : PV_FILE;
+    Prov p = (!m->liveread && page_find(m, a & ~0xfffull)) ? PV_DERIVED : PV_FILE;
+    int anylive = 0;
     for (int i = 0; i < n; i++){
         uint64_t at = a + (uint64_t)i;
+        if (live_byte(m, at, &b[i])){ anylive = 1; continue; }   /* see vm_peek */
         if (shadow_byte(m, at, &b[i])) continue;
         if (file_byte(m, at, &b[i])) continue;
         /* a byte read on its own is nearly always a character being walked
@@ -463,6 +485,9 @@ uint64_t vm_read(Vm *m, uint64_t a, int n, Prov *pr){
         p = PV_INVENTED;
     }
     uint64_t v = assemble(m, b, n);
+    /* one invented byte still makes the whole value invented; short of
+       that, a value the process supplied is a measurement */
+    if (anylive && p != PV_INVENTED) p = PV_LIVE;
     if (pr) *pr = p;
     memlog(m, a, v, n, 0, p);
     return v;

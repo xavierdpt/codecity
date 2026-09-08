@@ -1763,6 +1763,11 @@ Running the binary itself from inside the explorer is a different matter: it
 executes untrusted code of possibly foreign architecture, and it should not
 happen. Reading a trace file someone else produced deliberately is fine.
 
+The third possibility — driving the same body from a process stopped under gdb
+*right now*, launched or attached to — is worked out in
+`docs/live-wisps.md`, which also proposes the revision this paragraph needs if
+that is ever built.
+
 ---
 
 ## 15. Change list

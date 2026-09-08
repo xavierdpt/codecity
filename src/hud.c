@@ -213,7 +213,7 @@ void hud_stress(App *a){
    its provenance and what it points at, the flags, the stack near rsp,
    and the last few memory references.                              */
 
-static const char *PROVMARK = " ~= *";     /* none invented file derived call */
+static const char *PROVMARK = " ~= *!";    /* none invented file derived call live */
 
 /* What the run is doing, in the three words the two readouts share.  A wisp
    stepping over a call is neither paused nor simply running: it is off in
@@ -254,20 +254,48 @@ static void state_sheet(App *a){
 
     char t[220], ann[80];
     float y = py + 10;
-    glColor4f(1.00f, 0.72f, 0.42f, 1);
-    snprintf(t, sizeof t, "SIMULATED -- every value below is invented or computed"
-                          " from invented values");
+    int live = w->src == WS_LIVE;
+    if (live){
+        glColor4f(0.55f, 0.90f, 1.00f, 1);
+        snprintf(t, sizeof t, "LIVE -- every value below was read out of a real"
+                              " process stopped under gdb");
+    } else {
+        glColor4f(1.00f, 0.72f, 0.42f, 1);
+        snprintf(t, sizeof t, "SIMULATED -- every value below is invented or computed"
+                              " from invented values");
+    }
     text_mono_2d(px + 14, y, 14, t); y += lh + 3;
     glColor4f(0.90f, 0.92f, 0.96f, 1);
-    snprintf(t, sizeof t, "step %u   fuel %d   %.1f/s   cpu %s   %s",
-             m->steps, m->fuel, w->rate, vm_cpu_name(), wisp_state(w));
+    if (live)
+        snprintf(t, sizeof t, "stop %u   pid %d   %s", m->steps,
+                 (int)a->livePid, wisp_state(w));
+    else
+        snprintf(t, sizeof t, "step %u   fuel %d   %.1f/s   cpu %s   %s",
+                 m->steps, m->fuel, w->rate, vm_cpu_name(), wisp_state(w));
     text_mono_2d(px + 14, y, 15, t); y += lh + 6;
+
+    /* §4's accounting.  A wisp that quietly skipped a million instructions
+       of libc would be lying by omission, so what it stepped over is on
+       the sheet beside what it walked.                               */
+    if (live && (w->nover || w->nparked)){
+        glColor4f(0.72f, 0.86f, 0.96f, 1);
+        snprintf(t, sizeof t, "left this file %d time%s: %d call%s run whole and "
+                              "returned, %d with nowhere to return to",
+                 w->nover + w->nparked, w->nover + w->nparked == 1 ? "" : "s",
+                 w->nover, w->nover == 1 ? "" : "s", w->nparked);
+        text_mono_2d(px + 14, y, 14, t); y += lh;
+        if (w->wentTo[0]){
+            snprintf(t, sizeof t, "   the last one ran %s", w->wentTo);
+            text_mono_2d(px + 14, y, 14, t); y += lh;
+        }
+        y += 4;
+    }
 
     /* the registers, with what each one points at */
     for (int j = 0; j < nshow; j++){
         int i = show[j];
         const VReg *g = &m->r[i];
-        char mark = PROVMARK[g->prov <= PV_CALL ? g->prov : 0];
+        char mark = PROVMARK[g->prov <= PV_LIVE ? g->prov : 0];
         if (g->prov == PV_NONE){
             glColor4f(0.42f, 0.45f, 0.50f, 1);
             snprintf(t, sizeof t, "%-4s   (untouched)", m->rname[i]);
@@ -276,6 +304,7 @@ static void state_sheet(App *a){
             if (g->prov == PV_INVENTED)   glColor4f(0.58f, 0.64f, 0.70f, 1);
             else if (g->prov == PV_FILE)  glColor4f(0.70f, 0.95f, 0.80f, 1);
             else if (g->prov == PV_CALL)  glColor4f(0.92f, 0.78f, 0.50f, 1);
+            else if (g->prov == PV_LIVE)  glColor4f(0.62f, 0.90f, 1.00f, 1);
             else                          glColor4f(0.84f, 0.88f, 0.94f, 1);
             snprintf(t, sizeof t, "%-4s %c%016llx  %-8s %s", m->rname[i], mark,
                      (unsigned long long)g->v, vm_prov_name(g->prov), ann);
@@ -328,10 +357,16 @@ static void state_sheet(App *a){
         if (any) y += 4;
     }
 
-    /* the stack near rsp -- the part people actually want to see, and it
-       costs nothing extra: it is only memory (§1) */
+    /* The stack near rsp -- the part people actually want to see, and it
+       costs nothing extra: it is only memory (§1).
+       Under a live wisp the Vm's memory layers are still the simulated
+       ones: shadow, then the file, then invention.  Showing invented
+       bytes under a banner that says LIVE would be the exact dishonesty
+       the banner exists to prevent, so they are withheld until the live
+       memory layer lands (docs/live-wisps.md L7).                    */
     glColor4f(0.86f, 0.90f, 0.72f, 1);
-    text_mono_2d(px + 14, y, 14, "stack"); y += lh;
+    text_mono_2d(px + 14, y, 14, live ? "stack -- read from the process" : "stack");
+    y += lh;
     uint64_t sp = vm_slot_get(m, m->spSlot >= 0 ? m->spSlot : 0);
     for (int i = 0; i < 5; i++){
         uint64_t at = sp + (uint64_t)i * 8, v;

@@ -144,6 +144,9 @@ you step in rather than one sculpture at a time as you walk between them.
 | `F` | file browser — arrows, type to filter, `Enter` to open, `Backspace` to edit |
 | `M` `G` `V` `R` | minimap, wireframe, free-fly, back to the plaza |
 | `F1` | controls and legend |
+| `L` | with `--debug`: stop the real process on the instruction you are standing next to, and read its actual registers |
+| `T` / `I` | with a live wisp: step the real CPU one instruction |
+| `K` | with a live wisp: run at its own rate; again to stop, or to take the process back if a call hangs |
 | `F2` | text stress test: 200 never-repeated strings a frame, first out of the monospace atlas, then through the string cache |
 | `X` | start (or stop) a **wisp** in the code room you are standing in — a CPU state that walks it |
 | `K` `-` `=` `N` | run / pause · slower · faster · a different run |
@@ -170,6 +173,7 @@ you step in rather than one sculpture at a time as you walk between them.
 | `src/vmcheck.c` | replays `tests/vm-corpus.txt` — states a real CPU produced — through `vmx86.c` and reports any divergence, and counts how much of a file's text is reachable with no analysis at all |
 | `tools/oracle.c`, `tools/oracle.py` | the generator for that corpus: a gdb script that single-steps one instruction at a time from a chosen register state. Needs gdb and an x86 host; the everyday test does not |
 | `src/wisp.c` | the body: which instruction the state is standing on, how it eases to the next one, the per-instruction visit counts the loop policy needs |
+| `src/live.c` | a real process stopped under gdb, spoken to over GDB/MI: spawn, step, read registers and memory, and take the child down however we exit. Also the address map -- everything in the city is a *file* address and a live PIE is somewhere else, so `live_to_file()` and `file_to_live()` are the only two places an address crosses between the two worlds. Nothing else yet uses it: it is the transport the *live* wisp of `docs/live-wisps.md` will carry, built and tested on its own first |
 | `src/hud.c` | readouts, minimap, detail sheet, help, file browser |
 | `src/main.c` | window, event loop, file loading, and the four headless modes |
 
@@ -194,6 +198,41 @@ you step in rather than one sculpture at a time as you walk between them.
                             # shadow pages, frees everything, does not move
                             # disasm_live(), and takes the same path twice.  -v shows
                             # the first twenty divergences
+./codecity FILE --gdbtest N  # headless check of the gdb transport: N launch/step/kill
+                            # cycles (default 20) plus every abort path, asserting
+                            # that no gdb and no inferior is left running.  The one
+                            # mode that needs gdb installed; see docs/live-wisps.md
+./codecity FILE --attach PID # explore FILE while an already-running process is
+                            # looked at; it is left running when you quit.  Usually
+                            # refused -- ptrace_scope is 1 on most desktops, and the
+                            # message says which way through applies
+./codecity FILE --attachtest # headless check of that, including that a detached
+                            # process is still running, and not left stopped
+./codecity FILE --memtest    # headless check that memory is read from the process:
+                            # a global the program changed must not still show the
+                            # value the file was built with
+./codecity FILE --debug P    # explore FILE while P runs under gdb (default: FILE
+                            # itself).  Press L in a code room to stop the process
+                            # on the instruction you are standing next to.  This
+                            # runs the program -- the same act as running it
+                            # yourself; no key inside the app can start one
+./codecity FILE --debug P --runtest N
+                            # let a live wisp run at full rate for N frames of the
+                            # real loop and report how much of each frame went
+                            # into gdb, against the same loop with no wisp in it
+./codecity FILE --steptest N # step the real CPU N times (default 10000) and check the
+                            # city agrees where we are at every step; reports the
+                            # cost per step, and every call it ran whole because
+                            # it left this file.  Add --naive to turn the step-over
+                            # policy off and walk through libc instead -- slow on
+                            # purpose, it measures what the policy is worth
+./codecity FILE --statetest  # headless check that the registers shown are the ones
+                            # gdb reports, field for field, at the same stop
+./codecity FILE --maptest P  # headless check that a live address and a file address
+                            # name the same room: runs P (default: FILE itself)
+                            # under gdb and maps its entry point back through the
+                            # city.  Give P to explore a library and run something
+                            # that loads it
 ./tools/gen-corpus.sh        # regenerate tests/vm-corpus.txt from this machine's CPU
                             # (needs gdb and an x86-64 host; --vmtest does not)
 ```

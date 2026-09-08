@@ -10,6 +10,15 @@
 #include "vm.h"
 #include "model.h"
 
+typedef struct Live Live;   /* live.h; the wisp only ever holds a pointer */
+
+/* Where this wisp's values come from.  A session is either reading a real
+   process or simulating one and never both, but the wisp still carries the
+   discriminator: the body, the trail, the panel and the ports are shared
+   code, and the one thing that must never be in doubt is whether the
+   number in front of you was measured or invented.                   */
+typedef enum { WS_INVENTED, WS_LIVE } WispSrc;
+
 #define WISP_RATE_MIN  0.5f
 #define WISP_RATE_MAX  20.0f
 #define WISP_TRAIL     16       /* §7: sixteen is plenty */
@@ -17,6 +26,20 @@
 
 typedef struct Wisp {
     Vm        vm;
+    uint8_t   src;              /* WispSrc */
+    uint8_t   askedFor;         /* the live register filter has been set */
+    uint8_t   naive;            /* §4 C2 off: leave the file rather than step
+                                   over the call.  Only --steptest --naive
+                                   sets it, to measure what C2 is worth. */
+    /* L5: the frame loop cannot wait for a call to come back, so it does
+       not.  `waiting` means a continue is out there and the step will be
+       finished in whatever frame the answer arrives; pend* is the little
+       that has to survive until then.                                */
+    uint8_t   async, waiting;
+    int       pendUnit, pendIdx;
+    uint8_t   pendCls;
+    uint64_t  pendEnd;
+    uint32_t  pendBefore;
     int       unit;             /* chamber alcove, -1 when the room is its own */
     int       cur, prev;        /* instruction indices in that alcove's Disasm */
     int       prevUnit;
@@ -74,6 +97,14 @@ typedef struct Wisp {
     /* what the run did, for the HUD and for --vmtest */
     int       nsteps, nports, nret, nstop, nleft;
     uint64_t  lastPort;
+
+    /* §4's accounting for a live run.  An excursion is the code leaving
+       this file: `nover` were run whole and came back (C2), `nparked` had
+       nowhere to come back to and the run stopped there (C1).  Both are
+       shown, because a wisp that silently skipped a million instructions
+       of libc would be lying by omission.                            */
+    int       nover, nparked;
+    char      wentTo[72];       /* where the last excursion went, named */
 } Wisp;
 
 /* Spawn in a room (a chamber starts in the alcove being stood at, or 0).
@@ -99,6 +130,27 @@ void  wisp_restart(Wisp *w, const Building *b, const Room *r, uint64_t seed);
    Returns 0 when the address is not in the new room after all.       */
 int   wisp_rehome(Wisp *w, const Room *r, uint64_t addr);
 void  wisp_stop(Wisp *w, const char *why);
+
+/* ---- a wisp whose values are read rather than invented (L2) --------
+   Spawned at a file address the process is actually stopped on, and
+   refilled from the inferior at every stop.  It runs no semantics at all:
+   the CPU already did.                                              */
+Wisp *wisp_spawn_live(const Building *b, const Room *r, const Elf *e,
+                      uint64_t fileaddr);
+/* Read the stopped process's registers and flags into the wisp, tagging
+   every one PV_LIVE, and stand it on `fileaddr`.  0 when that address is
+   not in this room's decoding.                                      */
+int   wisp_live_sync(Wisp *w, const Room *r, Live *L, uint64_t fileaddr);
+/* One real instruction: step the process and read where it ended up.  0
+   when the run stopped -- off the map, out of the room, or the process
+   ended -- and then *offmap carries the live pc it went to, so the caller
+   can say where rather than only that.                              */
+int   wisp_step_live(Wisp *w, const Room *r, Live *L, uint64_t *offmap);
+/* Every frame while the wisp is waiting for a call out of the file to
+   come back.  1 when the step finished this frame.                  */
+int   wisp_live_poll(Wisp *w, const Room *r, Live *L, uint64_t *offmap);
+/* the live counterpart of wisp_tick(): let it run at its own rate */
+void  wisp_tick_live(Wisp *w, const Room *r, Live *L, float dt);
 /* Decline a call the wisp asked to follow: unmake it, apply the step-over
    contract instead, and carry on in this room -- §8 B1's behaviour, chosen
    one call at a time.  Returns 0 when there was nothing to decline (a

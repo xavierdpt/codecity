@@ -13,3 +13,7 @@ crash.log
 
 # vendored debugger sources, fetched locally
 ddd/
+
+# test fixtures are checked in as source; the binaries are built by hand
+tests/workload
+tests/attachable
